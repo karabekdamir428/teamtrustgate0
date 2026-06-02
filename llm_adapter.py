@@ -37,9 +37,7 @@ class LLMProvider(ABC):
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Переключено на актуальную модель gemini-2.5-flash для исправления ошибки 404
-        self.base_url = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent)"
-
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     async def _call(self, contents: list, system_prompt: str = "") -> str:
         payload = {
             "contents": contents,
