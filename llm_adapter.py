@@ -11,6 +11,7 @@ from config import CONFIG
 
 logger = logging.getLogger("teamtrustgate")
 
+
 class LLMProvider(ABC):
     @abstractmethod
     async def _call(self, messages: list, system_prompt: str = "") -> str: ...
@@ -26,7 +27,6 @@ class LLMProvider(ABC):
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         text = text.strip()
-        # Полноценное удаление markdown-тегов формата json
         text = re.sub(r'^```json\s*', '', text, flags=re.IGNORECASE)
         text = re.sub(r'^```\s*', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\s*```$', '', text, flags=re.IGNORECASE)
@@ -35,7 +35,6 @@ class LLMProvider(ABC):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Поиск валидного JSON объекта внутри текста, если ИИ прислал лишний текст
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
                 try:
@@ -45,7 +44,6 @@ class LLMProvider(ABC):
             raise ValueError(f"No JSON found in response: {text[:200]}")
 
     async def _call_with_retry(self, call_func, *args, **kwargs) -> str:
-        """Обертка с экспоненциальным ретраем для обработки ошибок 503, 429 и таймаутов."""
         max_retries = 3
         base_delay = 2.0
         
@@ -54,25 +52,22 @@ class LLMProvider(ABC):
                 return await call_func(*args, **kwargs)
             except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
                 error_msg = str(e)
-                # Ловим только сетевые сбои, перегрузки (503) и рейт-лимиты (429)
                 if any(marker in error_msg for marker in ["503", "429", "unavailable", "timeout", "exhausted"]):
                     if attempt == max_retries:
                         logger.error(f"❌ [Attempt {attempt}/{max_retries}] Проблемы с API. Попытки исчерпаны.")
                         raise e
                     
-                    # Экспоненциальная задержка + случайный джиттер
                     delay = (base_delay ** attempt) + random.uniform(0.5, 1.5)
                     logger.warning(f"⚠️ [Attempt {attempt}/{max_retries}] Сбой API ({error_msg}). Повтор через {delay:.2f} сек...")
                     await asyncio.sleep(delay)
                 else:
-                    # Если ошибка содержательная (401 Bad Auth, 400 Bad Request) — ретраить бесполезно
                     raise e
 
 
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent)"
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
     async def _call(self, contents: list, system_prompt: str = "") -> str:
         async def _raw_post():
@@ -115,7 +110,7 @@ class GeminiProvider(LLMProvider):
 class DeepSeekProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.deepseek.com/v1/chat/completions](https://api.deepseek.com/v1/chat/completions)"
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         async def _raw_post():
@@ -157,7 +152,7 @@ class DeepSeekProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)"
+        self.base_url = "https://api.openai.com/v1/chat/completions"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         async def _raw_post():
@@ -199,7 +194,7 @@ class OpenAIProvider(LLMProvider):
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)"
+        self.base_url = "https://api.anthropic.com/v1/messages"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         async def _raw_post():
@@ -257,10 +252,12 @@ class ResilientFailoverProvider(LLMProvider):
         for i, provider in enumerate(providers):
             try:
                 return await provider.analyze(user_message, collected_answers, prompt_template)
-            except Exception as e:
-                logger.error(f"🚨 Ошибка в провайдере {provider.__class__.__name__} при анализе: {e}")
+            except Exception:
+                logger.exception(
+                    f"🚨 Ошибка в провайдере {provider.__class__.__name__} при анализе"
+                )
                 if i == len(providers) - 1:
-                    raise e
+                    raise
                 logger.warning(f"🔄 Переключаемся на резервный LLM-провайдер для этапа [Analyze]...")
 
     async def dedup_compare(self, problem_a: str, problem_b: str, prompt_template: str) -> str:
@@ -268,10 +265,12 @@ class ResilientFailoverProvider(LLMProvider):
         for i, provider in enumerate(providers):
             try:
                 return await provider.dedup_compare(problem_a, problem_b, prompt_template)
-            except Exception as e:
-                logger.error(f"🚨 Ошибка в провайдере {provider.__class__.__name__} при дедупликации: {e}")
+            except Exception:
+                logger.exception(
+                    f"🚨 Ошибка в провайдере {provider.__class__.__name__} при дедупликации"
+                )
                 if i == len(providers) - 1:
-                    raise e
+                    raise
                 logger.warning(f"🔄 Переключаемся на резервный LLM-провайдер для этапа [Dedup]...")
 
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
@@ -279,10 +278,12 @@ class ResilientFailoverProvider(LLMProvider):
         for i, provider in enumerate(providers):
             try:
                 return await provider.score(analysis, prompt_template)
-            except Exception as e:
-                logger.error(f"🚨 Ошибка в провайдере {provider.__class__.__name__} при скоринге: {e}")
+            except Exception:
+                logger.exception(
+                    f"🚨 Ошибка в провайдере {provider.__class__.__name__} при скоринге"
+                )
                 if i == len(providers) - 1:
-                    raise e
+                    raise
                 logger.warning(f"🔄 Переключаемся на резервный LLM-провайдер для этапа [Scoring]...")
 
 
@@ -307,6 +308,14 @@ def get_llm_provider() -> LLMProvider:
     
     fallback_providers = []
     
+    # --- Логирование ключей для диагностики Railway ---
+    logger.info(f"LLM_PROVIDER = {primary_name}")
+    logger.info(f"LLM_API_KEY loaded = {bool(CONFIG.LLM_API_KEY)}")
+    logger.info(f"LLM_API_KEY len = {len(CONFIG.LLM_API_KEY) if CONFIG.LLM_API_KEY else 0}")
+    logger.info(f"DEEPSEEK_API_KEY loaded = {bool(CONFIG.DEEPSEEK_API_KEY)}")
+    logger.info(f"DEEPSEEK_API_KEY len = {len(CONFIG.DEEPSEEK_API_KEY) if CONFIG.DEEPSEEK_API_KEY else 0}")
+    # -------------------------------------------------
+
     if primary_name.lower() == "gemini" and CONFIG.DEEPSEEK_API_KEY:
         try:
             fallback_providers.append(_create_provider("deepseek"))
