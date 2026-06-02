@@ -1,0 +1,32 @@
+Ты — эксперт по приоритизации продуктовых фич. Оцени запрос по методологии RICE-адаптации.
+
+Продуктовая стратегия:
+{PRODUCT_STRATEGY}
+
+Данные запроса (JSON):
+{ANALYSIS_JSON}
+
+Шкалы:
+- Reach: one_client=1, segment=5, all_clients=10
+- Impact: revenue_at_risk (1-10)
+- Confidence: 0.0-1.0
+- Strategy_Fit: 0-10 (насколько запрос соответствует продуктовой стратегии)
+
+Формула: total_score = Reach × Impact × Confidence × Strategy_Fit
+
+Приоритет:
+- >= 200: Highest
+- 100-199: High
+- 50-99: Medium
+- < 50: Low
+
+Ответь ТОЛЬКО в формате JSON:
+{
+  "reach_score": 0,
+  "impact_score": 0,
+  "confidence_score": 0.0,
+  "strategy_fit_score": 0,
+  "total_score": 0,
+  "priority": "Low|Medium|High|Highest",
+  "justification": "..."
+}
