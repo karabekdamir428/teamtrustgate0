@@ -8,6 +8,10 @@ class Config:
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+    
+    # НОВАЯ ПЕРЕМЕННАЯ: Ключ для резервного ИИ (DeepSeek)
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    
     JIRA_URL: str = os.getenv("JIRA_URL", "").rstrip("/")
     JIRA_EMAIL: str = os.getenv("JIRA_EMAIL", "")
     JIRA_API_TOKEN: str = os.getenv("JIRA_API_TOKEN", "")
@@ -24,6 +28,7 @@ class Config:
 
     @classmethod
     def validate(cls):
+        # Базовые переменные, без которых приложение вообще не запустится
         required = [
             ("TELEGRAM_TOKEN", cls.TELEGRAM_TOKEN),
             ("LLM_API_KEY", cls.LLM_API_KEY),
@@ -32,7 +37,14 @@ class Config:
             ("JIRA_API_TOKEN", cls.JIRA_API_TOKEN),
             ("JIRA_PROJECT_KEY", cls.JIRA_PROJECT_KEY),
         ]
+        
         missing = [name for name, val in required if not val]
+        
+        # ДИНАМИЧЕСКАЯ ПРОВЕРКА: Если основным провайдером выбран именно DeepSeek,
+        # проверяем, чтобы DEEPSEEK_API_KEY или LLM_API_KEY были заполнены
+        if cls.LLM_PROVIDER.lower() == "deepseek" and not cls.DEEPSEEK_API_KEY and not cls.LLM_API_KEY:
+            missing.append("DEEPSEEK_API_KEY (or LLM_API_KEY)")
+            
         if missing:
             raise ValueError(f"Missing required env vars: {', '.join(missing)}")
 
