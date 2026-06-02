@@ -1,4 +1,4 @@
-"""LLM Provider Adapter with Gemini, OpenAI, Anthropic support."""
+"""LLM Provider Adapter with Gemini, DeepSeek, OpenAI, Anthropic support."""
 import json
 import re
 import asyncio
@@ -37,7 +37,8 @@ class LLMProvider(ABC):
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        # Переключено на актуальную модель gemini-2.5-flash для исправления ошибки 404
+        self.base_url = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent)"
 
     async def _call(self, contents: list, system_prompt: str = "") -> str:
         payload = {
@@ -72,10 +73,48 @@ class GeminiProvider(LLMProvider):
         text = await self._call([{"role": "user", "parts": [{"text": prompt}]}])
         return self._extract_json(text)
 
+class DeepSeekProvider(LLMProvider):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "[https://api.deepseek.com/v1/chat/completions](https://api.deepseek.com/v1/chat/completions)"
+
+    async def _call(self, messages: list, system_prompt: str = "") -> str:
+        payload = {
+            "model": "deepseek-chat",
+            "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + messages,
+            "temperature": 0.2,
+            "max_tokens": 2048,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CONFIG.LLM_TIMEOUT)) as session:
+            async with session.post(self.base_url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"DeepSeek API error {resp.status}: {text[:500]}")
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+
+    async def analyze(self, user_message: str, collected_answers: list, prompt_template: str) -> Dict[str, Any]:
+        context = " | ".join(collected_answers) if collected_answers else ""
+        prompt = prompt_template.replace("{USER_MESSAGE}", user_message).replace("{COLLECTED_ANSWERS}", context).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
+        text = await self._call([{"role": "user", "content": prompt}], "You are a product analyst. Respond only in JSON.")
+        return self._extract_json(text)
+
+    async def dedup_compare(self, problem_a: str, problem_b: str, prompt_template: str) -> str:
+        prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{PROBLEM_B}", problem_b)
+        text = await self._call([{"role": "user", "content": prompt}], "Respond only DUPLICATE or UNIQUE.")
+        return "DUPLICATE" if "DUPLICATE" in text.upper() else "UNIQUE"
+
+    async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
+        analysis_json = json.dumps(analysis, ensure_ascii=False)
+        prompt = prompt_template.replace("{ANALYSIS_JSON}", analysis_json).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
+        text = await self._call([{"role": "user", "content": prompt}], "You are a product prioritization expert. Respond only in JSON.")
+        return self._extract_json(text)
+
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.base_url = "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         payload = {
@@ -113,7 +152,7 @@ class OpenAIProvider(LLMProvider):
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.anthropic.com/v1/messages"
+        self.base_url = "[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         payload = {
@@ -154,11 +193,14 @@ class AnthropicProvider(LLMProvider):
         return self._extract_json(text)
 
 def get_llm_provider() -> LLMProvider:
-    if CONFIG.LLM_PROVIDER == "gemini":
+    provider = CONFIG.LLM_PROVIDER.lower()
+    if provider == "gemini":
         return GeminiProvider(CONFIG.LLM_API_KEY)
-    elif CONFIG.LLM_PROVIDER == "openai":
+    elif provider == "deepseek":
+        return DeepSeekProvider(CONFIG.LLM_API_KEY)
+    elif provider == "openai":
         return OpenAIProvider(CONFIG.LLM_API_KEY)
-    elif CONFIG.LLM_PROVIDER == "anthropic":
+    elif provider == "anthropic":
         return AnthropicProvider(CONFIG.LLM_API_KEY)
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {CONFIG.LLM_PROVIDER}")
