@@ -293,7 +293,6 @@ def get_llm_provider() -> LLMProvider:
         if name_lower == "gemini":
             return GeminiProvider(CONFIG.LLM_API_KEY)
         elif name_lower == "deepseek":
-            # Используем специализированный ключ для Дипсика, если он задан, иначе общий
             api_key = CONFIG.DEEPSEEK_API_KEY if CONFIG.DEEPSEEK_API_KEY else CONFIG.LLM_API_KEY
             return DeepSeekProvider(api_key)
         elif name_lower == "openai":
@@ -308,8 +307,6 @@ def get_llm_provider() -> LLMProvider:
     
     fallback_providers = []
     
-    # Если основной ИИ — Gemini, а в конфиге прописан токен DeepSeek,
-    # мы безопасно подмешиваем DeepSeek в пул резерва на случай падения Google.
     if primary_name.lower() == "gemini" and CONFIG.DEEPSEEK_API_KEY:
         try:
             fallback_providers.append(_create_provider("deepseek"))
@@ -317,7 +314,7 @@ def get_llm_provider() -> LLMProvider:
         except Exception as e:
             logger.warning(f"⚠️ Ошибка при инициализации резервного DeepSeek: {e}")
 
-   if fallback_providers:
+    if fallback_providers:
         return ResilientFailoverProvider(primary_provider, fallback_providers)
     
     return primary_provider
