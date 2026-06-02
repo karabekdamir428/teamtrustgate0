@@ -1,9 +1,6 @@
 """TeamTrustGate — AI Agent for Sales Request Processing.
 Telegram → LLM → Jira
 """
-import telegram.ext
-telegram.ext.Application.__slots__ = ()
-telegram.ext.Updater.__slots__ = ()
 import asyncio
 import json
 import logging
@@ -275,6 +272,7 @@ async def _create_raw_ticket(update: Update, chat_id: int, text: str, username: 
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(CONFIG.TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("cancel", cancel_handler))
     app.add_handler(CommandHandler("status", status_handler))
