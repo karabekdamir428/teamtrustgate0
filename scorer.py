@@ -64,9 +64,12 @@ class Scorer:
 
         total = reach * impact * confidence * strategy_fit
         
-        if total >= 200:
+        # СТРОГИЙ СРЕЗ ДО 400 ПРЯМО В ФОЛБЕКЕ, ЧТОБЫ НЕ БЫЛО 450/400
+        total = min(total, 400.0)
+
+        if total >= 250: # Соответствует нашей новой шкале из промпта
             priority = "Highest"
-        elif total >= 100:
+        elif total >= 120:
             priority = "High"
         elif total >= 50:
             priority = "Medium"
