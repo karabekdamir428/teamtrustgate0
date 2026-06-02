@@ -19,25 +19,29 @@ class LLMProvider(ABC):
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
+        # Полноценное удаление markdown-тегов формата json
+        text = re.sub(r'^```json\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'^```\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*```$', '', text, flags=re.IGNORECASE)
         text = text.strip()
+        
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            # Поиск валидного JSON объекта внутри текста, если ИИ прислал лишний текст
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
-                return json.loads(match.group())
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
             raise ValueError(f"No JSON found in response: {text[:200]}")
 
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
     async def _call(self, contents: list, system_prompt: str = "") -> str:
         payload = {
             "contents": contents,
@@ -57,7 +61,8 @@ class GeminiProvider(LLMProvider):
     async def analyze(self, user_message: str, collected_answers: list, prompt_template: str) -> Dict[str, Any]:
         context = " | ".join(collected_answers) if collected_answers else ""
         prompt = prompt_template.replace("{USER_MESSAGE}", user_message).replace("{COLLECTED_ANSWERS}", context).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
-        text = await self._call([{"role": "user", "parts": [{"text": prompt}]}])
+        # Явное указание формата для предотвращения ошибок парсинга
+        text = await self._call([{"role": "user", "parts": [{"text": prompt}]}], system_prompt="You are a product analyst. Respond ONLY with a valid JSON object. Do not include markdown block formatting.")
         return self._extract_json(text)
 
     async def dedup_compare(self, problem_a: str, problem_b: str, prompt_template: str) -> str:
@@ -68,13 +73,13 @@ class GeminiProvider(LLMProvider):
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         analysis_json = json.dumps(analysis, ensure_ascii=False)
         prompt = prompt_template.replace("{ANALYSIS_JSON}", analysis_json).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
-        text = await self._call([{"role": "user", "parts": [{"text": prompt}]}])
+        text = await self._call([{"role": "user", "parts": [{"text": prompt}]}], system_prompt="You are a product prioritization expert. Respond ONLY with a valid JSON object.")
         return self._extract_json(text)
 
 class DeepSeekProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.deepseek.com/v1/chat/completions](https://api.deepseek.com/v1/chat/completions)"
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         payload = {
@@ -112,7 +117,7 @@ class DeepSeekProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)"
+        self.base_url = "https://api.openai.com/v1/chat/completions"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         payload = {
@@ -150,7 +155,7 @@ class OpenAIProvider(LLMProvider):
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)"
+        self.base_url = "https://api.anthropic.com/v1/messages"
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         payload = {
