@@ -317,5 +317,7 @@ def get_llm_provider() -> LLMProvider:
         except Exception as e:
             logger.warning(f"⚠️ Ошибка при инициализации резервного DeepSeek: {e}")
 
-    if fallback_providers:
-        return ResilientFailoverProvider(primary_provider, fallback
+   if fallback_providers:
+        return ResilientFailoverProvider(primary_provider, fallback_providers)
+    
+    return primary_provider
