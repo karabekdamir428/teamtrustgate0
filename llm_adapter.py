@@ -250,8 +250,6 @@ class ResilientFailoverProvider(LLMProvider):
         self.fallbacks = fallbacks
 
     async def _call(self, messages: list, system_prompt: str = "") -> str:
-        # Этот метод не должен вызываться напрямую извне для FailoverProvider,
-        # так как логика переключения реализована на уровне высокоуровневых методов.
         return await self.primary._call(messages, system_prompt)
 
     async def analyze(self, user_message: str, collected_answers: list, prompt_template: str) -> Dict[str, Any]:
@@ -295,7 +293,9 @@ def get_llm_provider() -> LLMProvider:
         if name_lower == "gemini":
             return GeminiProvider(CONFIG.LLM_API_KEY)
         elif name_lower == "deepseek":
-            return DeepSeekProvider(CONFIG.LLM_API_KEY)
+            # Используем специализированный ключ для Дипсика, если он задан, иначе общий
+            api_key = CONFIG.DEEPSEEK_API_KEY if CONFIG.DEEPSEEK_API_KEY else CONFIG.LLM_API_KEY
+            return DeepSeekProvider(api_key)
         elif name_lower == "openai":
             return OpenAIProvider(CONFIG.LLM_API_KEY)
         elif name_lower == "anthropic":
@@ -306,21 +306,16 @@ def get_llm_provider() -> LLMProvider:
     primary_name = CONFIG.LLM_PROVIDER
     primary_provider = _create_provider(primary_name)
     
-    # Резервный пул. Если в CONFIG заведены резервные ключи/модели, можно их распределить.
-    # Для базового Failover добавим OpenAI или DeepSeek в качестве альтернативы, если они настроены.
     fallback_providers = []
     
-    # Пример логики: если основной провайдер Gemini, то резервным ставим OpenAI (или наоборот)
-    # Выбирай резерв в зависимости от того, какие токены у тебя лежат в окружении.
-    try:
-        if primary_name.lower() == "gemini":
-            # Если упадет джемини, бот попытается подняться через OpenAI (если ключ совместим/указан)
-            # Или просто укажи вторую модель, чьи лимиты у тебя стабильны.
-            fallback_providers.append(_create_provider("openai"))
-    except Exception:
-        pass # Если резервный не сконфигурирован — игнорируем
+    # Если основной ИИ — Gemini, а в конфиге прописан токен DeepSeek,
+    # мы безопасно подмешиваем DeepSeek в пул резерва на случай падения Google.
+    if primary_name.lower() == "gemini" and CONFIG.DEEPSEEK_API_KEY:
+        try:
+            fallback_providers.append(_create_provider("deepseek"))
+            logger.info("🛡️ Резервный контур DeepSeek успешно интегрирован в отказоустойчивую фабрику.")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка при инициализации резервного DeepSeek: {e}")
 
     if fallback_providers:
-        return ResilientFailoverProvider(primary_provider, fallback_providers)
-    
-    return primary_provider
+        return ResilientFailoverProvider(primary_provider, fallback
