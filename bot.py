@@ -123,10 +123,14 @@ async def _handle_clarification(update: Update, chat_id: int, text: str, usernam
     await update.message.reply_text("⏳ Анализирую уточнения...")
 
     try:
+        # Благодаря ResilientFailoverProvider, этот вызов сам переключится на DeepSeek, если Gemini лежит
         analysis = await llm.analyze(original, collected, EXTRACTION_PROMPT)
     except Exception as e:
-        logger.error(f"ai_error during clarification: {e}")
-        await update.message.reply_text("⚠️ Ошибка анализа. Попробуйте еще раз или отправьте /cancel.")
+        # Полный отказ AI контура (и Gemini, и DeepSeek недоступны)
+        logger.error(f"🚨 Тотальный сбой ИИ-контура при уточнении: {e}")
+        # Склеиваем всю переписку в один текст для ручного разбора продуктологами в Jira
+        full_raw_history = f"Оригинальный запрос: {original}\nУточнения: " + " | ".join(collected)
+        await _create_raw_ticket(update, chat_id, full_raw_history, username, f"Ошибка при уточнении: {str(e)}")
         return
 
     confidence = float(analysis.get("confidence", 0))
@@ -158,7 +162,6 @@ async def _process_request(update: Update, chat_id: int, text: str, username: st
         analysis = await llm.analyze(text, collected_answers, EXTRACTION_PROMPT)
     except Exception as e:
         logger.error(f"ai_analysis_error: {e}")
-        # Fallback: create raw ticket
         await _create_raw_ticket(update, chat_id, text, username, str(e))
         return
 
