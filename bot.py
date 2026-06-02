@@ -1,6 +1,7 @@
 """TeamTrustGate — AI Agent for Sales Request Processing.
 Telegram → LLM → Jira
 """
+import telegram.ext._updater; telegram.ext._updater.Updater.__slots__ = ()
 import asyncio
 import json
 import logging
