@@ -5,7 +5,7 @@ import asyncio
 import random
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import aiohttp
 from config import CONFIG
 
@@ -23,7 +23,23 @@ class LLMProvider(ABC):
     async def dedup_compare(self, problem_a: str, problem_b: str, prompt_template: str) -> str: ...
 
     @abstractmethod
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]: ...
+
+    @abstractmethod
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]: ...
+
+    def _parse_batch_dedup_response(self, text: str, candidates: list) -> Optional[str]:
+        try:
+            result = self._extract_json(text)
+            duplicates = result.get("duplicates", [])
+            if duplicates:
+                return duplicates[0]
+        except ValueError:
+            if "DUPLICATE" in text.upper():
+                for ticket in candidates:
+                    if ticket["key"] in text:
+                        return ticket["key"]
+        return None
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         text = text.strip()
@@ -116,6 +132,15 @@ class GeminiProvider(LLMProvider):
         text = await self._call([{"role": "user", "parts": [{"text": prompt}]}])
         return "DUPLICATE" if "DUPLICATE" in text.upper() else "UNIQUE"
 
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]:
+        candidates_list = "\n".join(f"- {t['key']}: {t['summary']}" for t in candidates)
+        prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{CANDIDATES_LIST}", candidates_list)
+        text = await self._call(
+            [{"role": "user", "parts": [{"text": prompt}]}],
+            system_prompt="You are a deduplication system. Respond ONLY with a valid JSON object.",
+        )
+        return self._parse_batch_dedup_response(text, candidates)
+
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         analysis_json = json.dumps(analysis, ensure_ascii=False)
         prompt = prompt_template.replace("{ANALYSIS_JSON}", analysis_json).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
@@ -158,6 +183,15 @@ class DeepSeekProvider(LLMProvider):
         text = await self._call([{"role": "user", "content": prompt}], "Respond only DUPLICATE or UNIQUE.")
         return "DUPLICATE" if "DUPLICATE" in text.upper() else "UNIQUE"
 
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]:
+        candidates_list = "\n".join(f"- {t['key']}: {t['summary']}" for t in candidates)
+        prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{CANDIDATES_LIST}", candidates_list)
+        text = await self._call(
+            [{"role": "user", "content": prompt}],
+            "You are a deduplication system. Respond only in JSON.",
+        )
+        return self._parse_batch_dedup_response(text, candidates)
+
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         analysis_json = json.dumps(analysis, ensure_ascii=False)
         prompt = prompt_template.replace("{ANALYSIS_JSON}", analysis_json).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
@@ -199,6 +233,15 @@ class OpenAIProvider(LLMProvider):
         prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{PROBLEM_B}", problem_b)
         text = await self._call([{"role": "user", "content": prompt}], "Respond only DUPLICATE or UNIQUE.")
         return "DUPLICATE" if "DUPLICATE" in text.upper() else "UNIQUE"
+
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]:
+        candidates_list = "\n".join(f"- {t['key']}: {t['summary']}" for t in candidates)
+        prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{CANDIDATES_LIST}", candidates_list)
+        text = await self._call(
+            [{"role": "user", "content": prompt}],
+            "You are a deduplication system. Respond only in JSON.",
+        )
+        return self._parse_batch_dedup_response(text, candidates)
 
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         analysis_json = json.dumps(analysis, ensure_ascii=False)
@@ -247,6 +290,15 @@ class AnthropicProvider(LLMProvider):
         text = await self._call([{"role": "user", "content": prompt}], "Respond only DUPLICATE or UNIQUE.")
         return "DUPLICATE" if "DUPLICATE" in text.upper() else "UNIQUE"
 
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]:
+        candidates_list = "\n".join(f"- {t['key']}: {t['summary']}" for t in candidates)
+        prompt = prompt_template.replace("{PROBLEM_A}", problem_a).replace("{CANDIDATES_LIST}", candidates_list)
+        text = await self._call(
+            [{"role": "user", "content": prompt}],
+            "You are a deduplication system. Respond only in JSON.",
+        )
+        return self._parse_batch_dedup_response(text, candidates)
+
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         analysis_json = json.dumps(analysis, ensure_ascii=False)
         prompt = prompt_template.replace("{ANALYSIS_JSON}", analysis_json).replace("{PRODUCT_STRATEGY}", CONFIG.PRODUCT_STRATEGY)
@@ -289,6 +341,19 @@ class ResilientFailoverProvider(LLMProvider):
                     raise
                 logger.warning(f"🔄 Переключаемся на резервный LLM-провайдер для этапа [Dedup]...")
 
+    async def dedup_compare_batch(self, problem_a: str, candidates: list, prompt_template: str) -> Optional[str]:
+        providers = [self.primary] + self.fallbacks
+        for i, provider in enumerate(providers):
+            try:
+                return await provider.dedup_compare_batch(problem_a, candidates, prompt_template)
+            except Exception:
+                logger.exception(
+                    f"🚨 Ошибка в провайдере {provider.__class__.__name__} при batch-дедупликации"
+                )
+                if i == len(providers) - 1:
+                    raise
+                logger.warning(f"🔄 Переключаемся на резервный LLM-провайдер для этапа [Dedup Batch]...")
+
     async def score(self, analysis: dict, prompt_template: str) -> Dict[str, Any]:
         providers = [self.primary] + self.fallbacks
         for i, provider in enumerate(providers):
@@ -323,14 +388,10 @@ def get_llm_provider() -> LLMProvider:
     primary_provider = _create_provider(primary_name)
     
     fallback_providers = []
-    
-    # --- Логирование ключей для диагностики Railway ---
+
     logger.info(f"LLM_PROVIDER = {primary_name}")
     logger.info(f"LLM_API_KEY loaded = {bool(CONFIG.LLM_API_KEY)}")
-    logger.info(f"LLM_API_KEY len = {len(CONFIG.LLM_API_KEY) if CONFIG.LLM_API_KEY else 0}")
     logger.info(f"DEEPSEEK_API_KEY loaded = {bool(CONFIG.DEEPSEEK_API_KEY)}")
-    logger.info(f"DEEPSEEK_API_KEY len = {len(CONFIG.DEEPSEEK_API_KEY) if CONFIG.DEEPSEEK_API_KEY else 0}")
-    # -------------------------------------------------
 
     if primary_name.lower() == "gemini" and CONFIG.DEEPSEEK_API_KEY:
         try:
