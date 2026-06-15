@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, Defaults
 
 from config import CONFIG, Config
 from state_manager import STATE_MANAGER
@@ -15,6 +15,7 @@ from llm_adapter import get_llm_provider
 from jira_client import JIRA_CLIENT
 from deduplicator import Deduplicator
 from scorer import Scorer
+from parse_utils import parse_llm_number
 
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -133,7 +134,7 @@ async def _handle_clarification(update: Update, chat_id: int, text: str, usernam
         await _create_raw_ticket(update, chat_id, full_raw_history, username, f"Ошибка при уточнении: {str(e)}")
         return
 
-    confidence = float(analysis.get("confidence", 0))
+    confidence = parse_llm_number(analysis.get("confidence", 0))
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
@@ -167,7 +168,7 @@ async def _process_request(update: Update, chat_id: int, text: str, username: st
 
     logger.info(f"ai_analysis_completed confidence={analysis.get('confidence', 0)}")
 
-    confidence = float(analysis.get("confidence", 0))
+    confidence = parse_llm_number(analysis.get("confidence", 0))
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
@@ -274,7 +275,13 @@ async def _create_raw_ticket(update: Update, chat_id: int, text: str, username: 
 
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(CONFIG.TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(CONFIG.TELEGRAM_TOKEN)
+        .defaults(Defaults(parse_mode="Markdown"))
+        .concurrent_updates(True)
+        .build()
+    )
     
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("cancel", cancel_handler))
@@ -286,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ь
