@@ -3,6 +3,7 @@ import json
 from typing import Dict, Any
 from llm_adapter import LLMProvider
 from config import CONFIG
+from parse_utils import parse_llm_number
 
 class Scorer:
     def __init__(self, llm: LLMProvider):
@@ -18,12 +19,10 @@ class Scorer:
             return self._fallback_score(analysis)
 
     def _normalize(self, result: dict, analysis: dict) -> Dict[str, Any]:
-        total = result.get("total_score", 0)
-        if isinstance(total, str):
-            total = float(total)
+        total = parse_llm_number(result.get("total_score", 0))
 
         # Жесткое бизнес-правило (Enterprise-множитель) напрямую в коде
-        revenue_at_risk = float(analysis.get("revenue_at_risk", 0))
+        revenue_at_risk = parse_llm_number(analysis.get("revenue_at_risk", 0))
         is_enterprise = "альфа" in str(analysis.get("client_context", "")).lower() or "банк" in str(analysis.get("client_context", "")).lower()
         
         # Если критический риск для крупного клиента — вытягиваем приоритет вверх
@@ -53,8 +52,8 @@ class Scorer:
     def _fallback_score(self, analysis: dict) -> Dict[str, Any]:
         reach_map = {"one_client": 1, "segment": 5, "all_clients": 10}
         reach = reach_map.get(analysis.get("reach", "one_client"), 1)
-        impact = float(analysis.get("revenue_at_risk", 5))
-        confidence = float(analysis.get("confidence", 0.5))
+        impact = parse_llm_number(analysis.get("revenue_at_risk", 5), default=5.0)
+        confidence = parse_llm_number(analysis.get("confidence", 0.5), default=0.5)
         strategy_fit = 5
         
         # Защита от занижения в fallback режиме
