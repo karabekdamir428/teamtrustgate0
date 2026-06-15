@@ -2,10 +2,11 @@
 import base64
 import json
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 import aiohttp
 from config import CONFIG
+
 
 class JiraClient:
     def __init__(self):
@@ -38,7 +39,7 @@ class JiraClient:
                         if 500 <= resp.status < 600:
                             self._failure_count += 1
                             if self._failure_count >= 5:
-                                self._circuit_open_until = datetime.now(timezone.utc).replace(minute=datetime.now(timezone.utc).minute + 5)
+                                self._circuit_open_until = datetime.now(timezone.utc) + timedelta(minutes=5)
                             raise RuntimeError(f"Jira server error {resp.status}: {text[:500]}")
                         if resp.status == 401:
                             raise RuntimeError(f"Jira auth failed (401): check email and API token.")
@@ -87,5 +88,6 @@ class JiraClient:
     async def add_comment(self, issue_key: str, comment: str):
         payload = {"body": comment}
         await self._request("POST", f"/issue/{issue_key}/comment", payload)
+
 
 JIRA_CLIENT = JiraClient()
