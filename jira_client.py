@@ -12,10 +12,8 @@ from config import CONFIG
 
 logger = logging.getLogger("teamtrustgate")
 
-# Коды ошибок Jira которые не стоит ретраить — они не исправятся сами
 _NON_RETRYABLE_STATUSES = {400, 401, 403, 404}
 
-# Приоритеты Jira (маппинг из наших названий)
 _PRIORITY_MAP = {
     "Highest": "Highest",
     "High":    "High",
@@ -25,10 +23,6 @@ _PRIORITY_MAP = {
 
 
 class CircuitBreaker:
-    """
-    Простой circuit breaker для Jira.
-    После FAILURE_THRESHOLD ошибок подряд блокирует запросы на OPEN_DURATION минут.
-    """
     FAILURE_THRESHOLD = 5
     OPEN_DURATION_MINUTES = 5
 
@@ -41,20 +35,16 @@ class CircuitBreaker:
             return False
         if datetime.now(timezone.utc) < self._open_until:
             return True
-        # Время вышло — сбрасываем и даём попробовать снова
         self._reset()
         return False
 
     def record_failure(self):
         self._failure_count += 1
         if self._failure_count >= self.FAILURE_THRESHOLD:
-            # fix: было .replace(minute=...) — улетало в ошибку на 55-59 минутах
             self._open_until = datetime.now(timezone.utc) + timedelta(
                 minutes=self.OPEN_DURATION_MINUTES
             )
-            logger.error(
-                f"jira: circuit breaker ОТКРЫТ до {self._open_until.isoformat()}"
-            )
+            logger.error(f"jira: circuit breaker ОТКРЫТ до {self._open_until.isoformat()}")
 
     def record_success(self):
         if self._failure_count > 0:
@@ -102,13 +92,11 @@ class JiraClient:
                     ) as resp:
                         text = await resp.text()
 
-                        # Не ретраим клиентские ошибки
                         if resp.status in _NON_RETRYABLE_STATUSES:
                             raise RuntimeError(
                                 f"Jira {resp.status}: {_status_message(resp.status, text)}"
                             )
 
-                        # Серверные ошибки — ретраим, считаем в circuit breaker
                         if 500 <= resp.status < 600:
                             self._circuit.record_failure()
                             raise RuntimeError(
@@ -129,12 +117,9 @@ class JiraClient:
                 await asyncio.sleep(wait)
 
             except RuntimeError:
-                # Пробрасываем наши ошибки сразу, без ретрая
                 raise
 
-        raise RuntimeError(
-            f"Jira недоступна после {retries} попыток: {last_err}"
-        )
+        raise RuntimeError(f"Jira недоступна после {retries} попыток: {last_err}")
 
     async def search_recent_issues(
         self,
@@ -157,7 +142,6 @@ class JiraClient:
         status, text = await self._request("GET", endpoint)
         data = json.loads(text)
         issues = data.get("issues", [])
-
         result = [
             {
                 "key": i["key"],
@@ -167,6 +151,40 @@ class JiraClient:
             for i in issues
         ]
         logger.info(f"jira: найдено {len(result)} тикетов за последние {days} дней")
+        return result
+
+    async def search_user_issues(
+        self,
+        username: str,
+        max_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Возвращает последние тикеты созданные пользователем (для /list)."""
+        # Ищем по label teamtrustgate и тексту с упоминанием username в description
+        jql = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f'AND labels = "teamtrustgate" '
+            f'AND description ~ "{username}" '
+            f"ORDER BY created DESC"
+        )
+        endpoint = (
+            f"/search"
+            f"?jql={quote(jql, safe='')}"
+            f"&fields=summary,status,priority,key"
+            f"&maxResults={max_results}"
+        )
+        status, text = await self._request("GET", endpoint)
+        data = json.loads(text)
+        issues = data.get("issues", [])
+        result = [
+            {
+                "key": i["key"],
+                "summary": i["fields"].get("summary", ""),
+                "status":  i["fields"].get("status", {}).get("name", "—"),
+                "priority": i["fields"].get("priority", {}).get("name", "Low"),
+            }
+            for i in issues
+        ]
+        logger.info(f"jira: найдено {len(result)} тикетов пользователя {username}")
         return result
 
     async def create_issue(
@@ -195,6 +213,20 @@ class JiraClient:
         logger.info(f"jira: тикет создан {key}")
         return {"key": key, "url": url}
 
+    async def delete_issue(self, issue_key: str) -> None:
+        """Удаляет тикет из Jira. Необратимо."""
+        # DELETE возвращает 204 No Content — это не ошибка
+        # Временно убираем 404 из non-retryable чтобы получить нормальную ошибку
+        try:
+            await self._request("DELETE", f"/issue/{issue_key}")
+        except RuntimeError as e:
+            # 204 может быть распознан некорректно — проверяем
+            if "204" in str(e):
+                pass  # успех
+            else:
+                raise
+        logger.info(f"jira: тикет удалён {issue_key}")
+
     async def add_comment(self, issue_key: str, comment: str) -> None:
         """Добавляет комментарий к существующему тикету."""
         await self._request("POST", f"/issue/{issue_key}/comment", {"body": comment})
@@ -207,7 +239,6 @@ class JiraClient:
         if isinstance(desc, str):
             return desc
         if isinstance(desc, dict):
-            # Jira Cloud возвращает ADF (Atlassian Document Format) как dict
             return json.dumps(desc, ensure_ascii=False)
         return str(desc)
 
