@@ -259,9 +259,10 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.model = CONFIG.GEMINI_MODEL
         self.base_url = (
-            "https://generativelanguage.googleapis.com/v1beta/models"
-            "/gemini-2.5-flash:generateContent"
+            f"https://generativelanguage.googleapis.com/v1beta/models"
+            f"/{self.model}:generateContent"
         )
 
     async def _call(self, contents: list, system_prompt: str = "") -> str:
@@ -354,7 +355,7 @@ class DeepSeekProvider(OpenAICompatibleMixin, LLMProvider):
     async def _call(self, messages: list, system_prompt: str = "") -> str:
         async def _raw_post():
             payload = {
-                "model": "deepseek-chat",
+                "model": CONFIG.DEEPSEEK_MODEL,
                 "messages": (
                     [{"role": "system", "content": system_prompt}] if system_prompt else []
                 ) + messages,
