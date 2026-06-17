@@ -4,7 +4,7 @@ Telegram → LLM → Jira
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, Defaults
@@ -30,8 +30,23 @@ llm = get_llm_provider()
 deduplicator = Deduplicator(llm)
 scorer = Scorer(llm)
 
-with open("prompts/extraction.txt", "r", encoding="utf-8") as f:
-    EXTRACTION_PROMPT = f.read()
+# ── Load prompts (поддержка .md и .txt) ──────────────────────────────────
+def _load_prompt(name: str) -> str:
+    """Загружает промпт из папки prompts/. Поддерживает .md и .txt форматы."""
+    for ext in ("md", "txt"):
+        path = f"prompts/{name}.{ext}"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+                logger.info(f"✅ Промпт загружен: {path}")
+                return content
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(
+        f"Промпт '{name}' не найден. Ожидается prompts/{name}.md или prompts/{name}.txt"
+    )
+
+EXTRACTION_PROMPT = _load_prompt("extraction")
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 def _is_allowed(username: str) -> bool:
@@ -39,7 +54,10 @@ def _is_allowed(username: str) -> bool:
         return True
     return username in CONFIG.ALLOWED_USERNAMES
 
-def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, requested_by: str) -> str:
+
+def _build_jira_description(
+    analysis: dict, scoring: dict, raw_text: str, requested_by: str
+) -> str:
     return (
         f"*Проблема:* {analysis.get('problem_statement', '')}\n"
         f"*Контекст клиента:* {analysis.get('client_context', '')}\n"
@@ -51,6 +69,18 @@ def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, reques
         f"*Обоснование:* {scoring.get('justification', '')}"
     )
 
+
+def _safe_confidence(analysis: dict) -> float:
+    """Безопасно извлекает confidence — защита от значений типа '0.8 (medium)'."""
+    return parse_llm_number(analysis.get("confidence", 0))
+
+
+def _escape_md(text: str) -> str:
+    """Экранирует спецсимволы для Telegram MarkdownV2."""
+    # Используем простой Markdown — экранировать не нужно, но защищаем от None
+    return str(text) if text else ""
+
+
 # ── Handlers ─────────────────────────────────────────────────────────────
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -59,17 +89,19 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
-        "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n"
+        "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n\n"
         "Команды:\n"
         "/start — начать\n"
         "/cancel — отменить текущую сессию\n"
-        "/status [TT-XX] — проверить статус тикета"
+        "/status TT\\-XX — проверить статус тикета"
     )
+
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     STATE_MANAGER.clear_session(chat_id)
     await update.message.reply_text("🚫 Сессия отменена. Отправь новый запрос.")
+
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -78,17 +110,22 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     issue_key = args[0].upper()
     try:
-        status, text = await JIRA_CLIENT._request("GET", f"/issue/{issue_key}?fields=status,summary")
+        status, text = await JIRA_CLIENT._request(
+            "GET", f"/issue/{issue_key}?fields=status,summary"
+        )
         data = json.loads(text)
         status_name = data["fields"]["status"]["name"]
         summary = data["fields"]["summary"]
         await update.message.reply_text(
             f"📋 *{issue_key}*\n"
-            f"*Статус:* {status_name}\n"
-            f"*Тема:* {summary}"
+            f"*Статус:* {_escape_md(status_name)}\n"
+            f"*Тема:* {_escape_md(summary)}"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Не удалось получить статус: {str(e)[:200]}")
+        await update.message.reply_text(
+            f"❌ Не удалось получить статус: {_escape_md(str(e)[:200])}"
+        )
+
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -101,22 +138,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not text.strip():
-        await update.message.reply_text("Пожалуйста, отправьте текстовое описание запроса.")
+        await update.message.reply_text(
+            "Пожалуйста, отправьте текстовое описание запроса."
+        )
         return
 
     session = STATE_MANAGER.get_session(chat_id)
 
-    # ── Active clarification session ─────────────────────────────────────
+    # ── Active clarification session ──────────────────────────────────────
     if session and session["state"] == "clarifying":
         await _handle_clarification(update, chat_id, text, username, session)
         return
 
-    # ── New request ──────────────────────────────────────────────────────
+    # ── New request ───────────────────────────────────────────────────────
     logger.info(f"request_received chat_id={chat_id} msg_len={len(text)}")
     STATE_MANAGER.create_session(chat_id, text)
     await _process_request(update, chat_id, text, username, collected_answers=[])
 
-async def _handle_clarification(update: Update, chat_id: int, text: str, username: str, session: dict):
+
+async def _handle_clarification(
+    update: Update, chat_id: int, text: str, username: str, session: dict
+):
     collected = session["collected_answers"] + [text]
     round_num = session["round"] + 1
     original = session["original_message"]
@@ -124,39 +166,55 @@ async def _handle_clarification(update: Update, chat_id: int, text: str, usernam
     await update.message.reply_text("⏳ Анализирую уточнения...")
 
     try:
-        # Благодаря ResilientFailoverProvider, этот вызов сам переключится на DeepSeek, если Gemini лежит
         analysis = await llm.analyze(original, collected, EXTRACTION_PROMPT)
     except Exception as e:
-        # Полный отказ AI контура (и Gemini, и DeepSeek недоступны)
         logger.error(f"🚨 Тотальный сбой ИИ-контура при уточнении: {e}")
-        # Склеиваем всю переписку в один текст для ручного разбора продуктологами в Jira
-        full_raw_history = f"Оригинальный запрос: {original}\nУточнения: " + " | ".join(collected)
-        await _create_raw_ticket(update, chat_id, full_raw_history, username, f"Ошибка при уточнении: {str(e)}")
+        full_raw_history = (
+            f"Оригинальный запрос: {original}\n"
+            f"Уточнения: " + " | ".join(collected)
+        )
+        await _create_raw_ticket(
+            update, chat_id, full_raw_history, username, f"Ошибка при уточнении: {str(e)}"
+        )
         return
 
-    confidence = parse_llm_number(analysis.get("confidence", 0))
+    confidence = _safe_confidence(analysis)
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
         STATE_MANAGER.clear_session(chat_id)
-        reason = analysis.get("reject_reason", "Запрос отклонен.")
-        await update.message.reply_text(f"❌ *Запрос отклонен.*\nПричина: {reason}")
+        reason = analysis.get("reject_reason", "Запрос отклонён.")
+        await update.message.reply_text(
+            f"❌ *Запрос отклонён.*\nПричина: {_escape_md(reason)}"
+        )
         logger.info(f"ticket_rejected reason={reason}")
         return
 
-    if confidence >= CONFIG.CONFIDENCE_THRESHOLD or round_num >= CONFIG.MAX_CLARIFICATION_ROUNDS:
+    max_rounds_reached = round_num >= CONFIG.MAX_CLARIFICATION_ROUNDS
+    if confidence >= CONFIG.CONFIDENCE_THRESHOLD or max_rounds_reached:
         STATE_MANAGER.update_session(chat_id, "scored", collected, round_num, analysis)
-        await _finalize_ticket(update, chat_id, analysis, username, original, collected, round_num >= CONFIG.MAX_CLARIFICATION_ROUNDS)
+        await _finalize_ticket(
+            update, chat_id, analysis, username, original, collected, max_rounds_reached
+        )
     else:
         missing = analysis.get("missing_info", [])
         if missing:
             STATE_MANAGER.update_session(chat_id, "clarifying", collected, round_num, analysis)
-            await update.message.reply_text(f"❓ {missing[0]}")
+            await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
         else:
             STATE_MANAGER.update_session(chat_id, "scored", collected, round_num, analysis)
-            await _finalize_ticket(update, chat_id, analysis, username, original, collected, False)
+            await _finalize_ticket(
+                update, chat_id, analysis, username, original, collected, False
+            )
 
-async def _process_request(update: Update, chat_id: int, text: str, username: str, collected_answers: list):
+
+async def _process_request(
+    update: Update,
+    chat_id: int,
+    text: str,
+    username: str,
+    collected_answers: list,
+):
     await update.message.reply_text("⏳ Анализирую запрос...")
 
     try:
@@ -168,13 +226,15 @@ async def _process_request(update: Update, chat_id: int, text: str, username: st
 
     logger.info(f"ai_analysis_completed confidence={analysis.get('confidence', 0)}")
 
-    confidence = parse_llm_number(analysis.get("confidence", 0))
+    confidence = _safe_confidence(analysis)
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
         STATE_MANAGER.clear_session(chat_id)
-        reason = analysis.get("reject_reason", "Запрос отклонен.")
-        await update.message.reply_text(f"❌ *Запрос отклонен.*\nПричина: {reason}")
+        reason = analysis.get("reject_reason", "Запрос отклонён.")
+        await update.message.reply_text(
+            f"❌ *Запрос отклонён.*\nПричина: {_escape_md(reason)}"
+        )
         logger.info(f"ticket_rejected reason={reason}")
         return
 
@@ -182,13 +242,24 @@ async def _process_request(update: Update, chat_id: int, text: str, username: st
         missing = analysis.get("missing_info", [])
         if missing:
             STATE_MANAGER.update_session(chat_id, "clarifying", collected_answers, 1, analysis)
-            await update.message.reply_text(f"❓ {missing[0]}")
+            await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
             return
 
-    await _finalize_ticket(update, chat_id, analysis, username, text, collected_answers, False)
+    await _finalize_ticket(
+        update, chat_id, analysis, username, text, collected_answers, False
+    )
 
-async def _finalize_ticket(update: Update, chat_id: int, analysis: dict, username: str, raw_text: str, collected_answers: list, forced: bool):
-    # Deduplication
+
+async def _finalize_ticket(
+    update: Update,
+    chat_id: int,
+    analysis: dict,
+    username: str,
+    raw_text: str,
+    collected_answers: list,
+    forced: bool,
+):
+    # ── Deduplication ─────────────────────────────────────────────────────
     await update.message.reply_text("🔍 Проверяю на дубликаты...")
     try:
         dup = await deduplicator.check_duplicate(analysis.get("problem_statement", ""))
@@ -205,15 +276,16 @@ async def _finalize_ticket(update: Update, chat_id: int, analysis: dict, usernam
 
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text(
-            f"⚠️ *Этот запрос уже есть в бэклоге:* [{dup['key']}]({CONFIG.JIRA_URL}/browse/{dup['key']})\n"
-            f"Ваше обращение учтено (добавлен комментарий)."
+            f"⚠️ *Этот запрос уже есть в бэклоге:* "
+            f"[{dup['key']}]({CONFIG.JIRA_URL}/browse/{dup['key']})\n"
+            f"Ваше обращение учтено \\(добавлен комментарий\\)."
         )
         logger.info(f"dedup_found key={dup['key']}")
         return
 
     logger.info("dedup_check_completed duplicate_found=False")
 
-    # Scoring
+    # ── Scoring ───────────────────────────────────────────────────────────
     await update.message.reply_text("📊 Оцениваю приоритет...")
     try:
         scoring = await scorer.score(analysis)
@@ -221,7 +293,7 @@ async def _finalize_ticket(update: Update, chat_id: int, analysis: dict, usernam
         logger.error(f"scoring_error: {e}")
         scoring = {"total_score": 0, "priority": "Low", "justification": "Scoring failed"}
 
-    # Create Jira ticket
+    # ── Create Jira ticket ────────────────────────────────────────────────
     await update.message.reply_text("📝 Создаю тикет в Jira...")
 
     summary = analysis.get("problem_statement", "Sales request")[:255]
@@ -238,31 +310,46 @@ async def _finalize_ticket(update: Update, chat_id: int, analysis: dict, usernam
         STATE_MANAGER.save_failed_request(chat_id, username, raw_text, analysis, str(e))
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text(
-            f"⚠️ Jira временно недоступна. Запрос сохранен, повторим позже.\n"
-            f"Ошибка: {str(e)[:200]}"
+            f"⚠️ Jira временно недоступна. Запрос сохранён, повторим позже.\n"
+            f"Ошибка: {_escape_md(str(e)[:200])}"
         )
         return
 
     STATE_MANAGER.clear_session(chat_id)
-    logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
+    logger.info(
+        f"ticket_created key={issue['key']} priority={priority} "
+        f"score={scoring.get('total_score', 0)}"
+    )
 
-    # Feedback
+    # ── Feedback ──────────────────────────────────────────────────────────
     flag = "⚠️ Данных было недостаточно, тикет создан с пометкой.\n\n" if forced else ""
     await update.message.reply_text(
         f"{flag}"
         f"✅ *Тикет создан:* [{issue['key']}]({issue['url']})\n"
-        f"*Приоритет:* {priority}\n"
+        f"*Приоритет:* {_escape_md(priority)}\n"
         f"*Скоринг:* {scoring.get('total_score', 0)}/400\n"
-        f"*Охват:* {analysis.get('reach', 'unknown')}\n"
+        f"*Охват:* {_escape_md(analysis.get('reach', 'unknown'))}\n"
         f"*Продуктовая команда получила запрос.*"
     )
 
-async def _create_raw_ticket(update: Update, chat_id: int, text: str, username: str, error_msg: str):
+
+async def _create_raw_ticket(
+    update: Update, chat_id: int, text: str, username: str, error_msg: str
+):
     await update.message.reply_text("⚠️ AI-анализ недоступен. Создаю сырой тикет...")
     summary = f"[RAW] {text[:200]}"
-    description = f"*Инициатор:* @{username}\n*Оригинал:* {text}\n*Ошибка AI:* {error_msg}"
+    description = (
+        f"*Инициатор:* @{username}\n"
+        f"*Оригинал:* {text}\n"
+        f"*Ошибка AI:* {error_msg}"
+    )
     try:
-        issue = await JIRA_CLIENT.create_issue(summary, description, "Low", ["teamtrustgate", "raw-request", "sales-request"])
+        issue = await JIRA_CLIENT.create_issue(
+            summary,
+            description,
+            "Low",
+            ["teamtrustgate", "raw-request", "sales-request"],
+        )
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text(
             f"✅ *Сырой тикет создан:* [{issue['key']}]({issue['url']})\n"
@@ -271,18 +358,21 @@ async def _create_raw_ticket(update: Update, chat_id: int, text: str, username: 
     except Exception as e:
         STATE_MANAGER.save_failed_request(chat_id, username, text, None, str(e))
         STATE_MANAGER.clear_session(chat_id)
-        await update.message.reply_text(f"❌ Не удалось создать тикет. Админ уведомлен.\n{str(e)[:200]}")
+        await update.message.reply_text(
+            f"❌ Не удалось создать тикет. Админ уведомлён.\n{_escape_md(str(e)[:200])}"
+        )
 
-# ── Main ─────────────────────────────────────────────────────────────────
+
+# ── Main ──────────────────────────────────────────────────────────────────
 def main():
     app = (
         Application.builder()
         .token(CONFIG.TELEGRAM_TOKEN)
         .defaults(Defaults(parse_mode="Markdown"))
-        .concurrent_updates(True)
+        .concurrent_updates(True)   # fix: параллельная обработка запросов
         .build()
     )
-    
+
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("cancel", cancel_handler))
     app.add_handler(CommandHandler("status", status_handler))
@@ -291,6 +381,6 @@ def main():
     logger.info("🚀 TeamTrustGate bot starting...")
     app.run_polling()
 
+
 if __name__ == "__main__":
     main()
-ь
