@@ -126,7 +126,6 @@ class JiraClient:
         days: int = CONFIG.DEDUP_DAYS,
         max_results: int = 50,
     ) -> List[Dict[str, Any]]:
-        """Возвращает недавние тикеты проекта для дедупликации."""
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
@@ -158,8 +157,6 @@ class JiraClient:
         username: str,
         max_results: int = 5,
     ) -> List[Dict[str, Any]]:
-        """Возвращает последние тикеты созданные пользователем (для /list)."""
-        # Ищем по label teamtrustgate и тексту с упоминанием username в description
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f'AND labels = "teamtrustgate" '
@@ -187,6 +184,52 @@ class JiraClient:
         logger.info(f"jira: найдено {len(result)} тикетов пользователя {username}")
         return result
 
+    async def get_project_stats(self, days: int = 30) -> Dict[str, Any]:
+        """
+        Возвращает статистику по тикетам teamtrustgate из Jira:
+        - разбивка по приоритетам
+        - разбивка по статусам
+        - всего тикетов за период
+        - закрытых за период
+        """
+        jql_all = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f'AND labels = "teamtrustgate" '
+            f"AND created >= -{days}d "
+            f"ORDER BY created DESC"
+        )
+        endpoint = (
+            f"/search"
+            f"?jql={quote(jql_all, safe='')}"
+            f"&fields=priority,status,created"
+            f"&maxResults=200"
+        )
+        _, text = await self._request("GET", endpoint)
+        data   = json.loads(text)
+        issues = data.get("issues", [])
+        total  = data.get("total", len(issues))
+
+        # Разбивка по приоритетам
+        by_priority: Dict[str, int] = {}
+        by_status:   Dict[str, int] = {}
+        done_count = 0
+
+        for i in issues:
+            p = i["fields"].get("priority", {}).get("name", "Low")
+            s = i["fields"].get("status",   {}).get("name", "—")
+            by_priority[p] = by_priority.get(p, 0) + 1
+            by_status[s]   = by_status.get(s, 0) + 1
+            if s.lower() in ("done", "готово", "closed", "resolved"):
+                done_count += 1
+
+        return {
+            "total":       total,
+            "by_priority": by_priority,
+            "by_status":   by_status,
+            "done":        done_count,
+            "in_progress": by_status.get("In Progress", 0) + by_status.get("В работе", 0),
+        }
+
     async def create_issue(
         self,
         summary: str,
@@ -194,7 +237,6 @@ class JiraClient:
         priority: str,
         labels: list,
     ) -> Dict[str, Any]:
-        """Создаёт тикет в Jira и возвращает key + url."""
         jira_priority = _PRIORITY_MAP.get(priority, "Low")
         payload = {
             "fields": {
@@ -208,32 +250,26 @@ class JiraClient:
         }
         status, text = await self._request("POST", "/issue", payload)
         data = json.loads(text)
-        key = data.get("key")
-        url = f"{CONFIG.JIRA_URL}/browse/{key}"
+        key  = data.get("key")
+        url  = f"{CONFIG.JIRA_URL}/browse/{key}"
         logger.info(f"jira: тикет создан {key}")
         return {"key": key, "url": url}
 
     async def delete_issue(self, issue_key: str) -> None:
-        """Удаляет тикет из Jira. Необратимо."""
-        # DELETE возвращает 204 No Content — это не ошибка
-        # Временно убираем 404 из non-retryable чтобы получить нормальную ошибку
         try:
             await self._request("DELETE", f"/issue/{issue_key}")
         except RuntimeError as e:
-            # 204 может быть распознан некорректно — проверяем
             if "204" in str(e):
-                pass  # успех
+                pass
             else:
                 raise
         logger.info(f"jira: тикет удалён {issue_key}")
 
     async def add_comment(self, issue_key: str, comment: str) -> None:
-        """Добавляет комментарий к существующему тикету."""
         await self._request("POST", f"/issue/{issue_key}/comment", {"body": comment})
         logger.info(f"jira: комментарий добавлен к {issue_key}")
 
     def _extract_desc(self, desc) -> str:
-        """Безопасно извлекает текст описания из разных форматов Jira API."""
         if not desc:
             return ""
         if isinstance(desc, str):
