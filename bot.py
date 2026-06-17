@@ -33,6 +33,9 @@ llm = get_llm_provider()
 deduplicator = Deduplicator(llm)
 scorer = Scorer(llm)
 
+# Интервал проверки изменений статуса (секунды)
+STATUS_POLL_INTERVAL = 300  # 5 минут
+
 # ── Load prompts ──────────────────────────────────────────────────────────
 def _load_prompt(name: str) -> str:
     for ext in ("md", "txt"):
@@ -52,7 +55,6 @@ EXTRACTION_PROMPT = _load_prompt("extraction")
 
 # ── Keyboard builders ─────────────────────────────────────────────────────
 def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Кнопки под созданным тикетом."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
         [
@@ -66,7 +68,6 @@ def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     ])
 
 def _status_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Кнопки смены статуса под карточкой статуса."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
         [
@@ -93,7 +94,6 @@ def _dup_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     ]])
 
 def _preview_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки подтверждения перед созданием тикета."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Создать тикет", callback_data="preview:confirm")],
         [
@@ -108,9 +108,7 @@ def _is_allowed(username: str) -> bool:
         return True
     return username in CONFIG.ALLOWED_USERNAMES
 
-def _build_jira_description(
-    analysis: dict, scoring: dict, raw_text: str, requested_by: str
-) -> str:
+def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, requested_by: str) -> str:
     return (
         f"*Проблема:* {analysis.get('problem_statement', '')}\n"
         f"*Контекст клиента:* {analysis.get('client_context', '')}\n"
@@ -135,7 +133,6 @@ def _reach_label(reach: str) -> str:
     return {"one_client": "Один клиент", "segment": "Сегмент", "all_clients": "Все клиенты"}.get(reach, reach)
 
 def _build_preview(analysis: dict, scoring: dict) -> str:
-    """Текст превью тикета для подтверждения сейлзом."""
     priority = scoring.get("priority", "Low")
     reach    = analysis.get("reach", "unknown")
     return (
@@ -150,7 +147,6 @@ def _build_preview(analysis: dict, scoring: dict) -> str:
     )
 
 # ── Transition helpers ────────────────────────────────────────────────────
-# Названия переходов которые ищем в Jira (регистронезависимо)
 _TRANSITION_NAMES = {
     "in_progress": ["in progress", "в работе", "start progress", "начать работу"],
     "done":        ["done", "готово", "закрыть", "close", "resolved"],
@@ -165,6 +161,66 @@ _TRANSITION_LABELS = {
     "reject":      "🚫 Отклонено",
 }
 
+# ── Background job: проверка изменений статуса ─────────────────────────────
+async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Фоновая задача: каждые N минут проверяет статусы отслеживаемых тикетов
+    и уведомляет пользователей если статус изменился.
+    """
+    tracked = STATE_MANAGER.get_tracked_tickets()
+    if not tracked:
+        return
+
+    logger.info(f"poll: проверяю {len(tracked)} отслеживаемых тикетов")
+
+    for ticket in tracked:
+        issue_key   = ticket["issue_key"]
+        chat_id     = ticket["chat_id"]
+        last_status = ticket["last_status"]
+
+        try:
+            _, text = await JIRA_CLIENT._request(
+                "GET", f"/issue/{issue_key}?fields=status,summary"
+            )
+            d = json.loads(text)
+            current_status = d["fields"]["status"]["name"]
+            summary        = d["fields"]["summary"]
+        except Exception as e:
+            # Тикет мог быть удалён — перестаём отслеживать
+            if "404" in str(e):
+                logger.info(f"poll: тикет {issue_key} не найден, перестаём отслеживать")
+                STATE_MANAGER.untrack_ticket(issue_key)
+            else:
+                logger.warning(f"poll: ошибка проверки {issue_key}: {e}")
+            continue
+
+        # Статус изменился — уведомляем
+        if last_status and current_status != last_status:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"📬 *Обновление по тикету [{issue_key}]"
+                        f"({CONFIG.JIRA_URL}/browse/{issue_key})*\n\n"
+                        f"Статус изменился:\n"
+                        f"_{_escape_md(last_status)}_ → *{_escape_md(current_status)}*\n\n"
+                        f"📋 {_escape_md(summary[:80])}"
+                    ),
+                    parse_mode="Markdown",
+                )
+                logger.info(f"poll: уведомление отправлено {issue_key} {last_status}→{current_status}")
+            except Exception as e:
+                logger.warning(f"poll: не удалось отправить уведомление для {issue_key}: {e}")
+
+            # Если тикет закрыт/готов — перестаём отслеживать
+            if current_status.lower() in ("done", "готово", "closed", "resolved", "отклонено"):
+                STATE_MANAGER.untrack_ticket(issue_key)
+            else:
+                STATE_MANAGER.update_ticket_status(issue_key, current_status)
+        else:
+            # Первая проверка — просто сохраняем текущий статус
+            STATE_MANAGER.update_ticket_status(issue_key, current_status)
+
 # ── Callback query handler ─────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
@@ -175,7 +231,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user     = update.effective_user
     username = user.username or user.first_name or str(user.id)
 
-    # ── Превью: подтвердить создание ──────────────────────────────────────
     if data == "preview:confirm":
         session = STATE_MANAGER.get_session(chat_id)
         if not session or session.get("state") != "awaiting_confirmation":
@@ -185,7 +240,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("📝 Создаю тикет в Jira...")
         await _create_confirmed_ticket(query.message, chat_id, session, username)
 
-    # ── Превью: уточнить ──────────────────────────────────────────────────
     elif data == "preview:clarify":
         session = STATE_MANAGER.get_session(chat_id)
         if not session:
@@ -202,18 +256,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ Что именно нужно уточнить или исправить? Напиши — я пересоздам превью."
         )
 
-    # ── Превью: отменить ──────────────────────────────────────────────────
     elif data == "preview:cancel":
         STATE_MANAGER.clear_session(chat_id)
         await query.message.edit_reply_markup(reply_markup=None)
         await query.message.reply_text("🚫 Создание тикета отменено.")
 
-    # ── Смена статуса ─────────────────────────────────────────────────────
     elif data.startswith("transition:"):
         _, transition_type, issue_key = data.split(":", 2)
         await _handle_transition(query, issue_key, transition_type, username)
 
-    # ── Статус тикета ─────────────────────────────────────────────────────
     elif data.startswith("status:"):
         issue_key = data.split(":", 1)[1]
         try:
@@ -236,7 +287,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Не удалось получить статус: {_escape_md(str(e)[:200])}"
             )
 
-    # ── Подтверждение удаления ────────────────────────────────────────────
     elif data.startswith("delete_confirm:"):
         issue_key = data.split(":", 1)[1]
         await query.message.reply_text(
@@ -248,6 +298,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         issue_key = data.split(":", 1)[1]
         try:
             await JIRA_CLIENT.delete_issue(issue_key)
+            STATE_MANAGER.untrack_ticket(issue_key)  # перестаём отслеживать
             logger.info(f"ticket_deleted key={issue_key} by={username}")
             await query.message.edit_text(f"🗑 Тикет *{issue_key}* удалён.")
         except Exception as e:
@@ -261,13 +312,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_transition(query, issue_key: str, transition_type: str, username: str):
     """Меняет статус тикета в Jira через transitions API."""
     try:
-        # Получаем доступные переходы для этого тикета
         _, text = await JIRA_CLIENT._request("GET", f"/issue/{issue_key}/transitions")
         data        = json.loads(text)
         transitions = data.get("transitions", [])
 
-        # Ищем нужный переход по имени
-        target_names = _TRANSITION_NAMES.get(transition_type, [])
+        target_names  = _TRANSITION_NAMES.get(transition_type, [])
         transition_id = None
         matched_name  = None
 
@@ -279,7 +328,6 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
                 break
 
         if not transition_id:
-            # Показываем что доступно если не нашли
             available = ", ".join(t["name"] for t in transitions)
             await query.message.reply_text(
                 f"⚠️ Переход *{_TRANSITION_LABELS.get(transition_type, transition_type)}* "
@@ -288,12 +336,13 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
             )
             return
 
-        # Применяем переход
         await JIRA_CLIENT._request(
-            "POST",
-            f"/issue/{issue_key}/transitions",
+            "POST", f"/issue/{issue_key}/transitions",
             {"transition": {"id": transition_id}},
         )
+
+        # Обновляем сохранённый статус чтобы polling не дублировал уведомление
+        STATE_MANAGER.update_ticket_status(issue_key, matched_name)
 
         label = _TRANSITION_LABELS.get(transition_type, transition_type)
         logger.info(f"transition applied key={issue_key} type={transition_type} by={username}")
@@ -320,6 +369,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
         "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n\n"
+        "Я также буду присылать уведомления когда статус твоего тикета изменится.\n\n"
         "Команды:\n"
         "/start — начать\n"
         "/cancel — отменить текущую сессию\n"
@@ -434,9 +484,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _process_request(update, chat_id, text, username, collected_answers=[])
 
 # ── Core logic ─────────────────────────────────────────────────────────────
-async def _handle_clarification(
-    update: Update, chat_id: int, text: str, username: str, session: dict
-):
+async def _handle_clarification(update, chat_id, text, username, session):
     collected = session["collected_answers"] + [text]
     round_num = session["round"] + 1
     original  = session["original_message"]
@@ -471,9 +519,7 @@ async def _handle_clarification(
         else:
             await _show_preview(update, chat_id, analysis, username, original, collected, False, round_num)
 
-async def _process_request(
-    update: Update, chat_id: int, text: str, username: str, collected_answers: list
-):
+async def _process_request(update, chat_id, text, username, collected_answers):
     await update.message.reply_text("⏳ Анализирую запрос...")
 
     try:
@@ -503,10 +549,7 @@ async def _process_request(
 
     await _show_preview(update, chat_id, analysis, username, text, collected_answers, False, 1)
 
-async def _show_preview(
-    update: Update, chat_id: int, analysis: dict, username: str,
-    raw_text: str, collected_answers: list, forced: bool, round_num: int
-):
+async def _show_preview(update, chat_id, analysis, username, raw_text, collected_answers, forced, round_num):
     """Показывает превью тикета для подтверждения перед созданием."""
     await update.message.reply_text("🔍 Проверяю на дубликаты...")
 
@@ -540,7 +583,6 @@ async def _show_preview(
         logger.error(f"scoring_error: {e}")
         scoring = {"total_score": 0, "priority": "Low", "justification": "Scoring failed"}
 
-    # Сохраняем всё в сессии для создания после подтверждения
     STATE_MANAGER.update_session(
         chat_id, "awaiting_confirmation", collected_answers, round_num, {
             "analysis": analysis,
@@ -556,7 +598,7 @@ async def _show_preview(
         reply_markup=_preview_keyboard(),
     )
 
-async def _create_confirmed_ticket(message, chat_id: int, session: dict, username: str):
+async def _create_confirmed_ticket(message, chat_id, session, username):
     """Создаёт тикет после подтверждения сейлзом."""
     data     = session.get("analysis_json", {})
     analysis = data.get("analysis", {})
@@ -584,6 +626,8 @@ async def _create_confirmed_ticket(message, chat_id: int, session: dict, usernam
         return
 
     STATE_MANAGER.clear_session(chat_id)
+    # Начинаем отслеживать тикет для уведомлений об изменении статуса
+    STATE_MANAGER.track_ticket(issue["key"], chat_id, username, status="")
     logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
 
     flag = "⚠️ Данных было недостаточно, тикет создан с пометкой.\n\n" if forced else ""
@@ -593,13 +637,11 @@ async def _create_confirmed_ticket(message, chat_id: int, session: dict, usernam
         f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
         f"*Скоринг:* {scoring.get('total_score', 0)}/400\n"
         f"*Охват:* {_escape_md(analysis.get('reach', 'unknown'))}\n"
-        f"*Продуктовая команда получила запрос.*",
+        f"*Я уведомлю тебя когда статус изменится.*",
         reply_markup=_ticket_keyboard(issue["key"]),
     )
 
-async def _create_raw_ticket(
-    update: Update, chat_id: int, text: str, username: str, error_msg: str
-):
+async def _create_raw_ticket(update, chat_id, text, username, error_msg):
     await update.message.reply_text("⚠️ AI-анализ недоступен. Создаю сырой тикет...")
     try:
         issue = await JIRA_CLIENT.create_issue(
@@ -609,6 +651,7 @@ async def _create_raw_ticket(
             ["teamtrustgate", "raw-request", "sales-request"],
         )
         STATE_MANAGER.clear_session(chat_id)
+        STATE_MANAGER.track_ticket(issue["key"], chat_id, username, status="")
         await update.message.reply_text(
             f"✅ *Сырой тикет создан:* [{issue['key']}]({issue['url']})\n"
             f"Продуктовая команда рассмотрит запрос вручную.",
@@ -638,6 +681,15 @@ def main():
     app.add_handler(CommandHandler("delete", delete_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    # Фоновая задача: проверка изменений статуса каждые 5 минут
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(_poll_status_changes, interval=STATUS_POLL_INTERVAL, first=60)
+        logger.info(f"Status polling запущен (каждые {STATUS_POLL_INTERVAL}с)")
+    else:
+        logger.warning("JobQueue недоступна — уведомления об изменении статуса отключены. "
+                       "Установи: pip install 'python-telegram-bot[job-queue]'")
 
     logger.info("TeamTrustGate bot starting...")
     app.run_polling()
