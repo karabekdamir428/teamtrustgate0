@@ -375,7 +375,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel — отменить текущую сессию\n"
         "/status TT-XX — статус тикета\n"
         "/list — мои последние 5 тикетов\n"
-        "/delete TT-XX — удалить тикет"
+        "/delete TT-XX — удалить тикет\n"
+        "/stats — аналитика за 30 дней"
     )
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,6 +458,93 @@ async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚠️ Удалить тикет *{issue_key}*?\nЭто действие необратимо.",
         reply_markup=_confirm_delete_keyboard(issue_key),
+    )
+
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает аналитику по тикетам за последние 30 дней."""
+    user = update.effective_user
+    if not _is_allowed(user.username or ""):
+        await update.message.reply_text("❌ Доступ ограничен.")
+        return
+
+    await update.message.reply_text("📊 Собираю статистику...")
+
+    # Локальная статистика из SQLite
+    local = STATE_MANAGER.get_local_stats()
+
+    # Статистика из Jira
+    try:
+        jira = await JIRA_CLIENT.get_project_stats(days=30)
+    except Exception as e:
+        logger.warning(f"stats: не удалось получить данные из Jira: {e}")
+        jira = None
+
+    # ── Формируем сообщение ────────────────────────────────────────────
+    lines = ["📈 *Статистика TeamTrustGate*
+"]
+
+    # Общие цифры
+    lines.append(
+        f"*За последние 30 дней:*
+"
+        f"📋 Создано тикетов: *{local['this_month']}*
+"
+        f"📦 Всего через бота: *{local['total']}*"
+    )
+
+    if jira:
+        lines.append(
+            f"✅ Закрыто: *{jira['done']}*
+"
+            f"▶️ В работе: *{jira['in_progress']}*"
+        )
+
+    # Разбивка по приоритетам из Jira
+    if jira and jira["by_priority"]:
+        priority_order = ["Highest", "High", "Medium", "Low"]
+        emoji_map = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+        lines.append("
+*Распределение по приоритетам:*")
+        for p in priority_order:
+            count = jira["by_priority"].get(p, 0)
+            if count:
+                bar = "█" * min(count, 10) + ("+" if count > 10 else "")
+                lines.append(f"{emoji_map.get(p, '⚪')} {p}: {bar} *{count}*")
+
+    # Разбивка по статусам из Jira
+    if jira and jira["by_status"]:
+        lines.append("
+*По статусам:*")
+        for status, count in sorted(jira["by_status"].items(), key=lambda x: -x[1]):
+            lines.append(f"  _{_escape_md(status)}_: {count}")
+
+    # Топ сейлзов
+    if local["top_users"]:
+        lines.append("
+*🏆 Топ сейлзов:*")
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for idx, u in enumerate(local["top_users"]):
+            medal = medals[idx] if idx < len(medals) else "  "
+            lines.append(f"{medal} @{_escape_md(u['username'])}: *{u['count']}* тикетов")
+
+    # Упавшие запросы
+    if local["failed"] > 0:
+        lines.append(
+            f"
+⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
+            f"(*{local['failed']}* всего)"
+        )
+
+    await update.message.reply_text(
+        "
+".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔗 Открыть проект в Jira",
+                url=f"{CONFIG.JIRA_URL}/projects/{CONFIG.JIRA_PROJECT_KEY}"
+            )
+        ]])
     )
 
 # ── Message handler ────────────────────────────────────────────────────────
@@ -679,6 +767,7 @@ def main():
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("list",   list_handler))
     app.add_handler(CommandHandler("delete", delete_handler))
+    app.add_handler(CommandHandler("stats",  stats_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
