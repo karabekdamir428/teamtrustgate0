@@ -35,7 +35,6 @@ scorer = Scorer(llm)
 
 # ── Load prompts ──────────────────────────────────────────────────────────
 def _load_prompt(name: str) -> str:
-    """Загружает промпт из папки prompts/. Поддерживает .md и .txt форматы."""
     for ext in ("md", "txt"):
         path = f"prompts/{name}.{ext}"
         try:
@@ -53,14 +52,8 @@ EXTRACTION_PROMPT = _load_prompt("extraction")
 
 # ── Keyboard builders ─────────────────────────────────────────────────────
 def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Кнопки под сообщением о созданном тикете."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔗 Открыть в Jira",
-                url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"
-            ),
-        ],
+        [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
         [
             InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_confirm:{issue_key}"),
@@ -68,24 +61,25 @@ def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     ])
 
 def _confirm_delete_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Кнопки подтверждения удаления."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_yes:{issue_key}"),
-            InlineKeyboardButton("❌ Отмена",       callback_data=f"delete_no:{issue_key}"),
-        ]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_yes:{issue_key}"),
+        InlineKeyboardButton("❌ Отмена",       callback_data=f"delete_no:{issue_key}"),
+    ]])
 
 def _dup_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Кнопки под сообщением о найденном дубликате."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔗 Открыть дубликат", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"),
+        InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
+    ]])
+
+def _preview_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки под превью тикета перед созданием."""
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Создать тикет",  callback_data="preview:confirm")],
         [
-            InlineKeyboardButton(
-                "🔗 Открыть дубликат",
-                url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"
-            ),
-            InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
-        ]
+            InlineKeyboardButton("✏️ Уточнить",   callback_data="preview:clarify"),
+            InlineKeyboardButton("❌ Отменить",    callback_data="preview:cancel"),
+        ],
     ])
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -117,23 +111,76 @@ def _escape_md(text: str) -> str:
 def _priority_emoji(priority: str) -> str:
     return {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}.get(priority, "⚪")
 
-# ── Callback query handler (нажатия на кнопки) ────────────────────────────
+def _reach_label(reach: str) -> str:
+    return {"one_client": "Один клиент", "segment": "Сегмент", "all_clients": "Все клиенты"}.get(reach, reach)
+
+def _build_preview(analysis: dict, scoring: dict) -> str:
+    """Формирует текст превью тикета для подтверждения сейлзом."""
+    priority = scoring.get("priority", "Low")
+    reach    = analysis.get("reach", "unknown")
+    return (
+        f"🤖 *Вот что я понял из запроса:*\n\n"
+        f"📋 *Проблема:*\n{_escape_md(analysis.get('problem_statement', ''))}\n\n"
+        f"👤 *Клиент:* {_escape_md(analysis.get('client_context', 'не указан'))}\n"
+        f"💰 *Риск потери выручки:* {analysis.get('revenue_at_risk', 0)}/10\n"
+        f"📊 *Охват:* {_reach_label(reach)}\n"
+        f"🎯 *Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)} "
+        f"({scoring.get('total_score', 0)}/400)\n\n"
+        f"Всё верно? Создаём тикет?"
+    )
+
+# ── Callback query handler ─────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data or ""
-    user = update.effective_user
+    data     = query.data or ""
+    chat_id  = update.effective_chat.id
+    user     = update.effective_user
     username = user.username or user.first_name or str(user.id)
 
+    # ── Превью: подтвердить создание ──────────────────────────────────────
+    if data == "preview:confirm":
+        session = STATE_MANAGER.get_session(chat_id)
+        if not session or session.get("state") != "awaiting_confirmation":
+            await query.message.reply_text("⚠️ Сессия устарела. Отправь запрос заново.")
+            return
+        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.reply_text("📝 Создаю тикет в Jira...")
+        await _create_confirmed_ticket(query.message, chat_id, session, username, forced=False)
+
+    # ── Превью: уточнить ──────────────────────────────────────────────────
+    elif data == "preview:clarify":
+        session = STATE_MANAGER.get_session(chat_id)
+        if not session:
+            await query.message.reply_text("⚠️ Сессия устарела. Отправь запрос заново.")
+            return
+        # Переводим в режим уточнения
+        STATE_MANAGER.update_session(
+            chat_id, "clarifying",
+            session.get("collected_answers", []),
+            session.get("round", 0),
+            session.get("analysis_json"),
+        )
+        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "✏️ Что именно нужно уточнить или исправить? Напиши и я пересоздам превью."
+        )
+
+    # ── Превью: отменить ──────────────────────────────────────────────────
+    elif data == "preview:cancel":
+        STATE_MANAGER.clear_session(chat_id)
+        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.reply_text("🚫 Создание тикета отменено.")
+
     # ── Статус тикета ─────────────────────────────────────────────────────
-    if data.startswith("status:"):
+    elif data.startswith("status:"):
         issue_key = data.split(":", 1)[1]
         try:
             _, text = await JIRA_CLIENT._request(
                 "GET", f"/issue/{issue_key}?fields=status,summary,priority"
             )
-            d = json.loads(text)
+            d           = json.loads(text)
             status_name = d["fields"]["status"]["name"]
             summary     = d["fields"]["summary"]
             priority    = d["fields"].get("priority", {}).get("name", "—")
@@ -148,7 +195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Не удалось получить статус: {_escape_md(str(e)[:200])}"
             )
 
-    # ── Запрос подтверждения удаления ─────────────────────────────────────
+    # ── Подтверждение удаления ────────────────────────────────────────────
     elif data.startswith("delete_confirm:"):
         issue_key = data.split(":", 1)[1]
         await query.message.reply_text(
@@ -156,7 +203,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_confirm_delete_keyboard(issue_key),
         )
 
-    # ── Подтверждено — удаляем ────────────────────────────────────────────
     elif data.startswith("delete_yes:"):
         issue_key = data.split(":", 1)[1]
         try:
@@ -168,7 +214,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Не удалось удалить: {_escape_md(str(e)[:200])}"
             )
 
-    # ── Отмена удаления ───────────────────────────────────────────────────
     elif data.startswith("delete_no:"):
         await query.message.edit_text("✅ Удаление отменено.")
 
@@ -204,7 +249,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, text = await JIRA_CLIENT._request(
             "GET", f"/issue/{issue_key}?fields=status,summary,priority"
         )
-        d = json.loads(text)
+        d           = json.loads(text)
         status_name = d["fields"]["status"]["name"]
         summary     = d["fields"]["summary"]
         priority    = d["fields"].get("priority", {}).get("name", "—")
@@ -214,10 +259,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
             f"*Тема:* {_escape_md(summary)}",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🔗 Открыть в Jira",
-                    url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"
-                ),
+                InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"),
                 InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_confirm:{issue_key}"),
             ]])
         )
@@ -227,15 +269,12 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает последние 5 тикетов пользователя."""
     user = update.effective_user
     if not _is_allowed(user.username or ""):
         await update.message.reply_text("❌ Доступ ограничен.")
         return
-
     username = user.username or user.first_name or str(user.id)
     await update.message.reply_text("🔍 Ищу твои последние тикеты...")
-
     try:
         issues = await JIRA_CLIENT.search_user_issues(username, max_results=5)
     except Exception as e:
@@ -243,11 +282,9 @@ async def list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Не удалось получить тикеты: {_escape_md(str(e)[:200])}"
         )
         return
-
     if not issues:
         await update.message.reply_text("📭 Тикетов не найдено.")
         return
-
     lines = ["📋 *Твои последние тикеты:*\n"]
     for i in issues:
         emoji = _priority_emoji(i.get("priority", "Low"))
@@ -256,7 +293,6 @@ async def list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{_escape_md(i['summary'][:60])}\n"
             f"   Статус: _{_escape_md(i.get('status', '—'))}_"
         )
-
     await update.message.reply_text(
         "\n\n".join(lines),
         reply_markup=InlineKeyboardMarkup([[
@@ -268,17 +304,14 @@ async def list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет тикет с подтверждением через кнопки."""
     user = update.effective_user
     if not _is_allowed(user.username or ""):
         await update.message.reply_text("❌ Доступ ограничен.")
         return
-
     args = context.args
     if not args:
         await update.message.reply_text("Использование: /delete TT-42")
         return
-
     issue_key = args[0].upper()
     await update.message.reply_text(
         f"⚠️ Удалить тикет *{issue_key}*?\nЭто действие необратимо.",
@@ -287,25 +320,26 @@ async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Message handler ────────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    text = update.message.text or ""
+    user     = update.effective_user
+    chat_id  = update.effective_chat.id
+    text     = update.message.text or ""
     username = user.username or user.first_name or str(user.id)
 
     if not _is_allowed(user.username or ""):
         await update.message.reply_text("❌ Доступ ограничен.")
         return
-
     if not text.strip():
         await update.message.reply_text("Пожалуйста, отправьте текстовое описание запроса.")
         return
 
     session = STATE_MANAGER.get_session(chat_id)
 
+    # Если ждём уточнения после нажатия "Уточнить" в превью
     if session and session["state"] == "clarifying":
         await _handle_clarification(update, chat_id, text, username, session)
         return
 
+    # Новый запрос
     logger.info(f"request_received chat_id={chat_id} msg_len={len(text)}")
     STATE_MANAGER.create_session(chat_id, text)
     await _process_request(update, chat_id, text, username, collected_answers=[])
@@ -324,11 +358,8 @@ async def _handle_clarification(
         analysis = await llm.analyze(original, collected, EXTRACTION_PROMPT)
     except Exception as e:
         logger.error(f"ai_clarification_error: {e}")
-        full_raw = (
-            f"Оригинальный запрос: {original}\n"
-            f"Уточнения: " + " | ".join(collected)
-        )
-        await _create_raw_ticket(update, chat_id, full_raw, username, f"Ошибка при уточнении: {e}")
+        full_raw = f"Оригинальный запрос: {original}\nУточнения: " + " | ".join(collected)
+        await _create_raw_ticket(update, chat_id, full_raw, username, f"Ошибка: {e}")
         return
 
     confidence    = _safe_confidence(analysis)
@@ -342,16 +373,15 @@ async def _handle_clarification(
 
     max_rounds_reached = round_num >= CONFIG.MAX_CLARIFICATION_ROUNDS
     if confidence >= CONFIG.CONFIDENCE_THRESHOLD or max_rounds_reached:
-        STATE_MANAGER.update_session(chat_id, "scored", collected, round_num, analysis)
-        await _finalize_ticket(update, chat_id, analysis, username, original, collected, max_rounds_reached)
+        # Достаточно данных — показываем превью
+        await _show_preview(update, chat_id, analysis, username, original, collected, max_rounds_reached, round_num)
     else:
         missing = analysis.get("missing_info", [])
         if missing:
             STATE_MANAGER.update_session(chat_id, "clarifying", collected, round_num, analysis)
             await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
         else:
-            STATE_MANAGER.update_session(chat_id, "scored", collected, round_num, analysis)
-            await _finalize_ticket(update, chat_id, analysis, username, original, collected, False)
+            await _show_preview(update, chat_id, analysis, username, original, collected, False, round_num)
 
 async def _process_request(
     update: Update, chat_id: int, text: str, username: str, collected_answers: list
@@ -383,14 +413,17 @@ async def _process_request(
             await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
             return
 
-    await _finalize_ticket(update, chat_id, analysis, username, text, collected_answers, False)
+    # Данных достаточно — показываем превью
+    await _show_preview(update, chat_id, analysis, username, text, collected_answers, False, 1)
 
-async def _finalize_ticket(
+async def _show_preview(
     update: Update, chat_id: int, analysis: dict, username: str,
-    raw_text: str, collected_answers: list, forced: bool,
+    raw_text: str, collected_answers: list, forced: bool, round_num: int
 ):
-    # ── Deduplication ──────────────────────────────────────────────────────
+    """Показывает превью тикета сейлзу для подтверждения перед созданием."""
     await update.message.reply_text("🔍 Проверяю на дубликаты...")
+
+    # Дедупликация ДО показа превью — нет смысла показывать превью если это дубликат
     try:
         dup = await deduplicator.check_duplicate(analysis.get("problem_statement", ""))
     except Exception as e:
@@ -405,7 +438,6 @@ async def _finalize_ticket(
             )
         except Exception as e:
             logger.error(f"comment_error: {e}")
-
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text(
             f"⚠️ *Этот запрос уже есть в бэклоге:* "
@@ -416,9 +448,7 @@ async def _finalize_ticket(
         logger.info(f"dedup_found key={dup['key']}")
         return
 
-    logger.info("dedup_check_completed duplicate_found=False")
-
-    # ── Scoring ────────────────────────────────────────────────────────────
+    # Скоринг
     await update.message.reply_text("📊 Оцениваю приоритет...")
     try:
         scoring = await scorer.score(analysis)
@@ -426,8 +456,30 @@ async def _finalize_ticket(
         logger.error(f"scoring_error: {e}")
         scoring = {"total_score": 0, "priority": "Low", "justification": "Scoring failed"}
 
-    # ── Create Jira ticket ─────────────────────────────────────────────────
-    await update.message.reply_text("📝 Создаю тикет в Jira...")
+    # Сохраняем всё необходимое в сессии для создания тикета после подтверждения
+    STATE_MANAGER.update_session(
+        chat_id, "awaiting_confirmation", collected_answers, round_num, {
+            "analysis": analysis,
+            "scoring":  scoring,
+            "raw_text": raw_text,
+            "username": username,
+            "forced":   forced,
+        }
+    )
+
+    # Показываем превью с кнопками
+    await update.message.reply_text(
+        _build_preview(analysis, scoring),
+        reply_markup=_preview_keyboard(),
+    )
+
+async def _create_confirmed_ticket(message, chat_id: int, session: dict, username: str, forced: bool):
+    """Создаёт тикет после подтверждения сейлзом."""
+    data     = session.get("analysis_json", {})
+    analysis = data.get("analysis", {})
+    scoring  = data.get("scoring", {})
+    raw_text = data.get("raw_text", "")
+    forced   = data.get("forced", forced)
 
     summary     = analysis.get("problem_statement", "Sales request")[:255]
     description = _build_jira_description(analysis, scoring, raw_text, username)
@@ -442,21 +494,17 @@ async def _finalize_ticket(
         logger.error(f"jira_create_error: {e}")
         STATE_MANAGER.save_failed_request(chat_id, username, raw_text, analysis, str(e))
         STATE_MANAGER.clear_session(chat_id)
-        await update.message.reply_text(
+        await message.reply_text(
             f"⚠️ Jira временно недоступна. Запрос сохранён, повторим позже.\n"
             f"Ошибка: {_escape_md(str(e)[:200])}"
         )
         return
 
     STATE_MANAGER.clear_session(chat_id)
-    logger.info(
-        f"ticket_created key={issue['key']} priority={priority} "
-        f"score={scoring.get('total_score', 0)}"
-    )
+    logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
 
-    # ── Feedback с кнопками ────────────────────────────────────────────────
     flag = "⚠️ Данных было недостаточно, тикет создан с пометкой.\n\n" if forced else ""
-    await update.message.reply_text(
+    await message.reply_text(
         f"{flag}"
         f"✅ *Тикет создан:* [{issue['key']}]({issue['url']})\n"
         f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
