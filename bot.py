@@ -481,22 +481,18 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jira = None
 
     # ── Формируем сообщение ────────────────────────────────────────────
-    lines = ["📈 *Статистика TeamTrustGate*
-"]
+    lines = ["📈 *Статистика TeamTrustGate*\n"]
 
     # Общие цифры
     lines.append(
-        f"*За последние 30 дней:*
-"
-        f"📋 Создано тикетов: *{local['this_month']}*
-"
+        f"*За последние 30 дней:*\n"
+        f"📋 Создано тикетов: *{local['this_month']}*\n"
         f"📦 Всего через бота: *{local['total']}*"
     )
 
     if jira:
         lines.append(
-            f"✅ Закрыто: *{jira['done']}*
-"
+            f"✅ Закрыто: *{jira['done']}*\n"
             f"▶️ В работе: *{jira['in_progress']}*"
         )
 
@@ -504,8 +500,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if jira and jira["by_priority"]:
         priority_order = ["Highest", "High", "Medium", "Low"]
         emoji_map = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
-        lines.append("
-*Распределение по приоритетам:*")
+        lines.append("\n*Распределение по приоритетам:*")
         for p in priority_order:
             count = jira["by_priority"].get(p, 0)
             if count:
@@ -514,15 +509,13 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Разбивка по статусам из Jira
     if jira and jira["by_status"]:
-        lines.append("
-*По статусам:*")
+        lines.append("\n*По статусам:*")
         for status, count in sorted(jira["by_status"].items(), key=lambda x: -x[1]):
             lines.append(f"  _{_escape_md(status)}_: {count}")
 
     # Топ сейлзов
     if local["top_users"]:
-        lines.append("
-*🏆 Топ сейлзов:*")
+        lines.append("\n*🏆 Топ сейлзов:*")
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         for idx, u in enumerate(local["top_users"]):
             medal = medals[idx] if idx < len(medals) else "  "
@@ -531,14 +524,12 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Упавшие запросы
     if local["failed"] > 0:
         lines.append(
-            f"
-⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
+            f"\n⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
             f"(*{local['failed']}* всего)"
         )
 
     await update.message.reply_text(
-        "
-".join(lines),
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "🔗 Открыть проект в Jira",
