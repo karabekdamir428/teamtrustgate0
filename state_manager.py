@@ -36,7 +36,6 @@ class StateManager:
                     created_at TEXT
                 )
             """)
-            # Таблица отслеживания тикетов для уведомлений об изменении статуса
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tracked_tickets (
                     issue_key TEXT PRIMARY KEY,
@@ -107,9 +106,8 @@ class StateManager:
             )
             conn.commit()
 
-    # ── Ticket tracking (для уведомлений об изменении статуса) ────────────
+    # ── Ticket tracking ───────────────────────────────────────────────────
     def track_ticket(self, issue_key: str, chat_id: int, username: str, status: str = ""):
-        """Запоминает тикет чтобы отслеживать изменения его статуса."""
         now = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -121,7 +119,6 @@ class StateManager:
             conn.commit()
 
     def get_tracked_tickets(self) -> List[Dict[str, Any]]:
-        """Возвращает все отслеживаемые тикеты для проверки изменений."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM tracked_tickets").fetchall()
@@ -136,7 +133,6 @@ class StateManager:
             ]
 
     def update_ticket_status(self, issue_key: str, new_status: str):
-        """Обновляет сохранённый статус тикета после отправки уведомления."""
         now = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -146,10 +142,64 @@ class StateManager:
             conn.commit()
 
     def untrack_ticket(self, issue_key: str):
-        """Перестаёт отслеживать тикет (например после удаления или закрытия)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM tracked_tickets WHERE issue_key = ?", (issue_key,))
             conn.commit()
+
+    # ── Stats (для /stats команды) ────────────────────────────────────────
+    def get_local_stats(self) -> Dict[str, Any]:
+        """
+        Возвращает статистику из локальной БД:
+        - всего тикетов создано через бота
+        - топ сейлзов по количеству тикетов
+        - тикетов за этот месяц
+        - количество упавших запросов
+        """
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+
+            # Всего тикетов (включая уже закрытые — не только tracked)
+            total = conn.execute(
+                "SELECT COUNT(*) as cnt FROM tracked_tickets"
+            ).fetchone()["cnt"]
+
+            # Тикетов за этот месяц
+            this_month = conn.execute(
+                "SELECT COUNT(*) as cnt FROM tracked_tickets WHERE created_at >= ?",
+                (month_start,)
+            ).fetchone()["cnt"]
+
+            # Топ-5 сейлзов по количеству тикетов
+            top_users = conn.execute(
+                """SELECT username, COUNT(*) as cnt
+                FROM tracked_tickets
+                WHERE username IS NOT NULL AND username != ''
+                GROUP BY username
+                ORDER BY cnt DESC
+                LIMIT 5"""
+            ).fetchall()
+
+            # Упавших запросов
+            failed = conn.execute(
+                "SELECT COUNT(*) as cnt FROM failed_requests"
+            ).fetchone()["cnt"]
+
+            # Упавших за этот месяц
+            failed_month = conn.execute(
+                "SELECT COUNT(*) as cnt FROM failed_requests WHERE created_at >= ?",
+                (month_start,)
+            ).fetchone()["cnt"]
+
+        return {
+            "total":       total,
+            "this_month":  this_month,
+            "top_users":   [{"username": r["username"], "count": r["cnt"]} for r in top_users],
+            "failed":      failed,
+            "failed_month": failed_month,
+        }
 
 
 STATE_MANAGER = StateManager()
