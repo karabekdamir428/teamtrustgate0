@@ -17,7 +17,6 @@ class Config:
     LLM_API_KEY:     str = os.getenv("LLM_API_KEY", "")
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
 
-    # Названия моделей — берутся из Railway Variables, дефолты на случай отсутствия
     GEMINI_MODEL:   str = os.getenv("GEMINI_MODEL",   "gemini-2.5-flash")
     DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
@@ -30,10 +29,18 @@ class Config:
     # ── Продуктовый контекст ──────────────────────────────────────────────
     PRODUCT_STRATEGY: str = os.getenv("PRODUCT_STRATEGY", "")
 
-    # ── Доступ ────────────────────────────────────────────────────────────
+    # ── Доступ и роли ─────────────────────────────────────────────────────
+    # Сейлзы: могут создавать тикеты, смотреть и управлять СВОИМИ
     ALLOWED_USERNAMES: list = [
-        u.strip()
+        u.strip().lstrip("@").lower()
         for u in os.getenv("ALLOWED_USERNAMES", "").split(",")
+        if u.strip()
+    ]
+
+    # Админы/менеджеры: полный доступ — удаление и смена статуса ЛЮБЫХ тикетов, /stats
+    ADMIN_USERNAMES: list = [
+        u.strip().lstrip("@").lower()
+        for u in os.getenv("ADMIN_USERNAMES", "").split(",")
         if u.strip()
     ]
 
@@ -54,10 +61,6 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """
-        Проверяет наличие обязательных переменных окружения.
-        Вызывается при старте бота — падает с понятной ошибкой если что-то не заполнено.
-        """
         required = [
             ("TELEGRAM_TOKEN",   cls.TELEGRAM_TOKEN),
             ("LLM_API_KEY",      cls.LLM_API_KEY),
@@ -69,7 +72,6 @@ class Config:
 
         missing = [name for name, val in required if not val]
 
-        # Если основной провайдер DeepSeek — нужен хотя бы один из ключей
         if (
             cls.LLM_PROVIDER.lower() == "deepseek"
             and not cls.DEEPSEEK_API_KEY
@@ -83,7 +85,6 @@ class Config:
                 f"Заполни их в Railway → Variables."
             )
 
-        # Предупреждения о необязательных но важных переменных
         if not cls.PRODUCT_STRATEGY:
             logger.warning(
                 "⚠️ PRODUCT_STRATEGY не задана — скоринг стратегического соответствия будет неточным"
@@ -92,14 +93,18 @@ class Config:
             logger.warning(
                 "⚠️ ALLOWED_USERNAMES не задан — бот доступен всем пользователям Telegram"
             )
+        if not cls.ADMIN_USERNAMES:
+            logger.warning(
+                "⚠️ ADMIN_USERNAMES не задан — никто не имеет админ-прав (/stats, управление чужими тикетами)"
+            )
 
         logger.info("✅ Конфигурация прошла валидацию")
-        logger.info(f"   LLM_PROVIDER  = {cls.LLM_PROVIDER}")
-        logger.info(f"   GEMINI_MODEL  = {cls.GEMINI_MODEL}")
+        logger.info(f"   LLM_PROVIDER   = {cls.LLM_PROVIDER}")
+        logger.info(f"   GEMINI_MODEL   = {cls.GEMINI_MODEL}")
         logger.info(f"   DEEPSEEK_MODEL = {cls.DEEPSEEK_MODEL}")
-        logger.info(f"   JIRA_PROJECT  = {cls.JIRA_PROJECT_KEY}")
-        logger.info(f"   DEDUP_DAYS    = {cls.DEDUP_DAYS}")
-        logger.info(f"   CONFIDENCE    = {cls.CONFIDENCE_THRESHOLD}")
+        logger.info(f"   JIRA_PROJECT   = {cls.JIRA_PROJECT_KEY}")
+        logger.info(f"   SALES_USERS    = {len(cls.ALLOWED_USERNAMES)}")
+        logger.info(f"   ADMIN_USERS    = {len(cls.ADMIN_USERNAMES)}")
 
 
 CONFIG = Config()
