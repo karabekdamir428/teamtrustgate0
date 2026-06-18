@@ -185,13 +185,7 @@ class JiraClient:
         return result
 
     async def get_project_stats(self, days: int = 30) -> Dict[str, Any]:
-        """
-        Возвращает статистику по тикетам teamtrustgate из Jira:
-        - разбивка по приоритетам
-        - разбивка по статусам
-        - всего тикетов за период
-        - закрытых за период
-        """
+        """Возвращает статистику по тикетам teamtrustgate из Jira."""
         jql_all = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f'AND labels = "teamtrustgate" '
@@ -209,7 +203,6 @@ class JiraClient:
         issues = data.get("issues", [])
         total  = data.get("total", len(issues))
 
-        # Разбивка по приоритетам
         by_priority: Dict[str, int] = {}
         by_status:   Dict[str, int] = {}
         done_count = 0
@@ -229,6 +222,41 @@ class JiraClient:
             "done":        done_count,
             "in_progress": by_status.get("In Progress", 0) + by_status.get("В работе", 0),
         }
+
+    async def export_issues(self, days: int = 90, max_results: int = 200) -> List[Dict[str, Any]]:
+        """
+        Выгружает все тикеты teamtrustgate за период со всеми полями для CSV экспорта.
+        """
+        jql = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f'AND labels = "teamtrustgate" '
+            f"AND created >= -{days}d "
+            f"ORDER BY created DESC"
+        )
+        endpoint = (
+            f"/search"
+            f"?jql={quote(jql, safe='')}"
+            f"&fields=summary,status,priority,created,updated,labels"
+            f"&maxResults={max_results}"
+        )
+        _, text = await self._request("GET", endpoint)
+        data   = json.loads(text)
+        issues = data.get("issues", [])
+
+        result = []
+        for i in issues:
+            f = i["fields"]
+            result.append({
+                "key":      i["key"],
+                "summary":  f.get("summary", ""),
+                "status":   f.get("status", {}).get("name", ""),
+                "priority": f.get("priority", {}).get("name", ""),
+                "created":  (f.get("created") or "")[:10],
+                "updated":  (f.get("updated") or "")[:10],
+                "labels":   ", ".join(f.get("labels", [])),
+            })
+        logger.info(f"jira: экспортировано {len(result)} тикетов за {days} дней")
+        return result
 
     async def create_issue(
         self,
