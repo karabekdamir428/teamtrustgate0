@@ -33,7 +33,6 @@ llm = get_llm_provider()
 deduplicator = Deduplicator(llm)
 scorer = Scorer(llm)
 
-# Интервал проверки изменений статуса (секунды)
 STATUS_POLL_INTERVAL = 300  # 5 минут
 
 # ── Load prompts ──────────────────────────────────────────────────────────
@@ -53,17 +52,49 @@ def _load_prompt(name: str) -> str:
 
 EXTRACTION_PROMPT = _load_prompt("extraction")
 
+# ── Роли и права доступа ──────────────────────────────────────────────────
+def _norm(username: str) -> str:
+    """Нормализует username: убирает @ и приводит к lowercase."""
+    return (username or "").lstrip("@").lower()
+
+def _is_allowed(username: str) -> bool:
+    """Сейлз или админ — есть доступ к боту вообще."""
+    u = _norm(username)
+    if not CONFIG.ALLOWED_USERNAMES and not CONFIG.ADMIN_USERNAMES:
+        return True  # списки пусты — открытый доступ (dev режим)
+    return u in CONFIG.ALLOWED_USERNAMES or u in CONFIG.ADMIN_USERNAMES
+
+def _is_admin(username: str) -> bool:
+    """Админ/менеджер — полный доступ."""
+    if not CONFIG.ADMIN_USERNAMES:
+        return False  # список пуст — никто не админ
+    return _norm(username) in CONFIG.ADMIN_USERNAMES
+
+def _can_manage_ticket(username: str, issue_key: str) -> bool:
+    """
+    Может ли пользователь управлять тикетом (удалять, менять статус)?
+    - Админ может управлять любым тикетом
+    - Сейлз — только своим (созданным им)
+    - Если владелец неизвестен (старый тикет) — только админ
+    """
+    if _is_admin(username):
+        return True
+    owner = STATE_MANAGER.get_ticket_owner(issue_key)
+    if owner is None:
+        return False  # неизвестный владелец — только админ может
+    return owner == _norm(username)
+
 # ── Keyboard builders ─────────────────────────────────────────────────────
 def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
         [
-            InlineKeyboardButton("📊 Статус",      callback_data=f"status:{issue_key}"),
-            InlineKeyboardButton("🗑 Удалить",     callback_data=f"delete_confirm:{issue_key}"),
+            InlineKeyboardButton("📊 Статус",   callback_data=f"status:{issue_key}"),
+            InlineKeyboardButton("🗑 Удалить",  callback_data=f"delete_confirm:{issue_key}"),
         ],
         [
-            InlineKeyboardButton("▶️ В работу",    callback_data=f"transition:in_progress:{issue_key}"),
-            InlineKeyboardButton("✅ Готово",       callback_data=f"transition:done:{issue_key}"),
+            InlineKeyboardButton("▶️ В работу", callback_data=f"transition:in_progress:{issue_key}"),
+            InlineKeyboardButton("✅ Готово",    callback_data=f"transition:done:{issue_key}"),
         ],
     ])
 
@@ -97,17 +128,12 @@ def _preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Создать тикет", callback_data="preview:confirm")],
         [
-            InlineKeyboardButton("✏️ Уточнить",  callback_data="preview:clarify"),
-            InlineKeyboardButton("❌ Отменить",   callback_data="preview:cancel"),
+            InlineKeyboardButton("✏️ Уточнить", callback_data="preview:clarify"),
+            InlineKeyboardButton("❌ Отменить",  callback_data="preview:cancel"),
         ],
     ])
 
 # ── Helpers ───────────────────────────────────────────────────────────────
-def _is_allowed(username: str) -> bool:
-    if not CONFIG.ALLOWED_USERNAMES:
-        return True
-    return username in CONFIG.ALLOWED_USERNAMES
-
 def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, requested_by: str) -> str:
     return (
         f"*Проблема:* {analysis.get('problem_statement', '')}\n"
@@ -136,15 +162,52 @@ def _build_preview(analysis: dict, scoring: dict) -> str:
     priority = scoring.get("priority", "Low")
     reach    = analysis.get("reach", "unknown")
     return (
-        f"🤖 *Вот что я понял из запроса:*\n\n"
+        "🤖 *Вот что я понял из запроса:*\n\n"
         f"📋 *Проблема:*\n{_escape_md(analysis.get('problem_statement', ''))}\n\n"
         f"👤 *Клиент:* {_escape_md(analysis.get('client_context', 'не указан'))}\n"
         f"💰 *Риск потери выручки:* {analysis.get('revenue_at_risk', 0)}/10\n"
         f"📊 *Охват:* {_reach_label(reach)}\n"
         f"🎯 *Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)} "
         f"({scoring.get('total_score', 0)}/400)\n\n"
-        f"Всё верно? Создаём тикет?"
+        "Всё верно? Создаём тикет?"
     )
+
+def _build_stats_message(local: dict, jira: dict | None) -> str:
+    parts = ["📈 *Статистика TeamTrustGate*\n"]
+    parts.append(
+        f"*За последние 30 дней:*\n"
+        f"📋 Создано тикетов: *{local['this_month']}*\n"
+        f"📦 Всего через бота: *{local['total']}*"
+    )
+    if jira:
+        parts.append(f"✅ Закрыто: *{jira['done']}*\n▶️ В работе: *{jira['in_progress']}*")
+    if jira and jira.get("by_priority"):
+        emoji_map = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+        rows = ["\n*Распределение по приоритетам:*"]
+        for p in ["Highest", "High", "Medium", "Low"]:
+            count = jira["by_priority"].get(p, 0)
+            if count:
+                bar = "█" * min(count, 10) + ("+" if count > 10 else "")
+                rows.append(f"{emoji_map.get(p, '⚪')} {p}: {bar} *{count}*")
+        parts.append("\n".join(rows))
+    if jira and jira.get("by_status"):
+        rows = ["\n*По статусам:*"]
+        for status, count in sorted(jira["by_status"].items(), key=lambda x: -x[1]):
+            rows.append(f"  _{_escape_md(status)}_: {count}")
+        parts.append("\n".join(rows))
+    if local.get("top_users"):
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        rows = ["\n*🏆 Топ сейлзов:*"]
+        for idx, u in enumerate(local["top_users"]):
+            medal = medals[idx] if idx < len(medals) else "  "
+            rows.append(f"{medal} @{_escape_md(u['username'])}: *{u['count']}* тикетов")
+        parts.append("\n".join(rows))
+    if local.get("failed", 0) > 0:
+        parts.append(
+            f"\n⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
+            f"(*{local['failed']}* всего)"
+        )
+    return "\n".join(parts)
 
 # ── Transition helpers ────────────────────────────────────────────────────
 _TRANSITION_NAMES = {
@@ -161,12 +224,8 @@ _TRANSITION_LABELS = {
     "reject":      "🚫 Отклонено",
 }
 
-# ── Background job: проверка изменений статуса ─────────────────────────────
+# ── Background job ─────────────────────────────────────────────────────────
 async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Фоновая задача: каждые N минут проверяет статусы отслеживаемых тикетов
-    и уведомляет пользователей если статус изменился.
-    """
     tracked = STATE_MANAGER.get_tracked_tickets()
     if not tracked:
         return
@@ -182,11 +241,10 @@ async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
             _, text = await JIRA_CLIENT._request(
                 "GET", f"/issue/{issue_key}?fields=status,summary"
             )
-            d = json.loads(text)
+            d              = json.loads(text)
             current_status = d["fields"]["status"]["name"]
             summary        = d["fields"]["summary"]
         except Exception as e:
-            # Тикет мог быть удалён — перестаём отслеживать
             if "404" in str(e):
                 logger.info(f"poll: тикет {issue_key} не найден, перестаём отслеживать")
                 STATE_MANAGER.untrack_ticket(issue_key)
@@ -194,7 +252,6 @@ async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"poll: ошибка проверки {issue_key}: {e}")
             continue
 
-        # Статус изменился — уведомляем
         if last_status and current_status != last_status:
             try:
                 await context.bot.send_message(
@@ -212,13 +269,11 @@ async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"poll: не удалось отправить уведомление для {issue_key}: {e}")
 
-            # Если тикет закрыт/готов — перестаём отслеживать
             if current_status.lower() in ("done", "готово", "closed", "resolved", "отклонено"):
                 STATE_MANAGER.untrack_ticket(issue_key)
             else:
                 STATE_MANAGER.update_ticket_status(issue_key, current_status)
         else:
-            # Первая проверка — просто сохраняем текущий статус
             STATE_MANAGER.update_ticket_status(issue_key, current_status)
 
 # ── Callback query handler ─────────────────────────────────────────────────
@@ -263,6 +318,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("transition:"):
         _, transition_type, issue_key = data.split(":", 2)
+        # Проверка прав: управлять статусом может владелец или админ
+        if not _can_manage_ticket(username, issue_key):
+            await query.message.reply_text(
+                "❌ Недостаточно прав. Менять статус может только создатель тикета или администратор."
+            )
+            return
         await _handle_transition(query, issue_key, transition_type, username)
 
     elif data.startswith("status:"):
@@ -275,12 +336,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_name = d["fields"]["status"]["name"]
             summary     = d["fields"]["summary"]
             priority    = d["fields"].get("priority", {}).get("name", "—")
+            # Кнопки управления показываем только если есть права
+            kb = _status_keyboard(issue_key) if _can_manage_ticket(username, issue_key) else None
             await query.message.reply_text(
                 f"📋 *{issue_key}*\n"
                 f"*Статус:* {_escape_md(status_name)}\n"
                 f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
                 f"*Тема:* {_escape_md(summary)}",
-                reply_markup=_status_keyboard(issue_key),
+                reply_markup=kb,
             )
         except Exception as e:
             await query.message.reply_text(
@@ -289,6 +352,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("delete_confirm:"):
         issue_key = data.split(":", 1)[1]
+        # Проверка прав на удаление
+        if not _can_manage_ticket(username, issue_key):
+            await query.message.reply_text(
+                "❌ Недостаточно прав. Удалить тикет может только его создатель или администратор."
+            )
+            return
         await query.message.reply_text(
             f"⚠️ Удалить тикет *{issue_key}*?\nЭто действие необратимо.",
             reply_markup=_confirm_delete_keyboard(issue_key),
@@ -296,9 +365,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("delete_yes:"):
         issue_key = data.split(":", 1)[1]
+        # Повторная проверка прав (защита от устаревших кнопок)
+        if not _can_manage_ticket(username, issue_key):
+            await query.message.reply_text("❌ Недостаточно прав.")
+            return
         try:
             await JIRA_CLIENT.delete_issue(issue_key)
-            STATE_MANAGER.untrack_ticket(issue_key)  # перестаём отслеживать
+            STATE_MANAGER.untrack_ticket(issue_key)
             logger.info(f"ticket_deleted key={issue_key} by={username}")
             await query.message.edit_text(f"🗑 Тикет *{issue_key}* удалён.")
         except Exception as e:
@@ -310,9 +383,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("✅ Удаление отменено.")
 
 async def _handle_transition(query, issue_key: str, transition_type: str, username: str):
-    """Меняет статус тикета в Jira через transitions API."""
     try:
-        _, text = await JIRA_CLIENT._request("GET", f"/issue/{issue_key}/transitions")
+        _, text     = await JIRA_CLIENT._request("GET", f"/issue/{issue_key}/transitions")
         data        = json.loads(text)
         transitions = data.get("transitions", [])
 
@@ -321,8 +393,7 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
         matched_name  = None
 
         for t in transitions:
-            t_name = t.get("name", "").lower()
-            if any(target in t_name for target in target_names):
+            if any(target in t.get("name", "").lower() for target in target_names):
                 transition_id = t["id"]
                 matched_name  = t["name"]
                 break
@@ -340,8 +411,6 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
             "POST", f"/issue/{issue_key}/transitions",
             {"transition": {"id": transition_id}},
         )
-
-        # Обновляем сохранённый статус чтобы polling не дублировал уведомление
         STATE_MANAGER.update_ticket_status(issue_key, matched_name)
 
         label = _TRANSITION_LABELS.get(transition_type, transition_type)
@@ -354,7 +423,6 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
                 InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
             ]])
         )
-
     except Exception as e:
         await query.message.reply_text(
             f"❌ Не удалось изменить статус: {_escape_md(str(e)[:200])}"
@@ -366,17 +434,26 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(user.username or ""):
         await update.message.reply_text("❌ Доступ ограничен.")
         return
-    await update.message.reply_text(
-        "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
-        "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n\n"
-        "Я также буду присылать уведомления когда статус твоего тикета изменится.\n\n"
-        "Команды:\n"
+
+    is_admin = _is_admin(user.username or "")
+    role_line = "👑 Роль: *Администратор*" if is_admin else "👤 Роль: *Сейлз*"
+
+    base_commands = (
         "/start — начать\n"
         "/cancel — отменить текущую сессию\n"
         "/status TT-XX — статус тикета\n"
         "/list — мои последние 5 тикетов\n"
-        "/delete TT-XX — удалить тикет\n"
-        "/stats — аналитика за 30 дней"
+        "/delete TT-XX — удалить тикет (только свой)"
+    )
+    admin_commands = "\n/stats — аналитика за 30 дней 👑" if is_admin else ""
+
+    await update.message.reply_text(
+        "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
+        f"{role_line}\n\n"
+        "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n\n"
+        "Я также буду присылать уведомления когда статус твоего тикета изменится.\n\n"
+        "Команды:\n"
+        f"{base_commands}{admin_commands}"
     )
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +462,11 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Сессия отменена. Отправь новый запрос.")
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_allowed(user.username or ""):
+        await update.message.reply_text("❌ Доступ ограничен.")
+        return
+    username = user.username or user.first_name or str(user.id)
     args = context.args
     if not args:
         await update.message.reply_text("Использование: /status TT-42")
@@ -398,12 +480,13 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_name = d["fields"]["status"]["name"]
         summary     = d["fields"]["summary"]
         priority    = d["fields"].get("priority", {}).get("name", "—")
+        kb = _status_keyboard(issue_key) if _can_manage_ticket(username, issue_key) else None
         await update.message.reply_text(
             f"📋 *{issue_key}*\n"
             f"*Статус:* {_escape_md(status_name)}\n"
             f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
             f"*Тема:* {_escape_md(summary)}",
-            reply_markup=_status_keyboard(issue_key),
+            reply_markup=kb,
         )
     except Exception as e:
         await update.message.reply_text(
@@ -450,86 +533,43 @@ async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(user.username or ""):
         await update.message.reply_text("❌ Доступ ограничен.")
         return
+    username = user.username or user.first_name or str(user.id)
     args = context.args
     if not args:
         await update.message.reply_text("Использование: /delete TT-42")
         return
     issue_key = args[0].upper()
+    # Проверка прав
+    if not _can_manage_ticket(username, issue_key):
+        await update.message.reply_text(
+            "❌ Недостаточно прав. Удалить тикет может только его создатель или администратор."
+        )
+        return
     await update.message.reply_text(
         f"⚠️ Удалить тикет *{issue_key}*?\nЭто действие необратимо.",
         reply_markup=_confirm_delete_keyboard(issue_key),
     )
 
-
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает аналитику по тикетам за последние 30 дней."""
+    """Аналитика — только для админов."""
     user = update.effective_user
-    if not _is_allowed(user.username or ""):
-        await update.message.reply_text("❌ Доступ ограничен.")
+    if not _is_admin(user.username or ""):
+        await update.message.reply_text(
+            "❌ Команда /stats доступна только администраторам."
+        )
         return
 
     await update.message.reply_text("📊 Собираю статистику...")
 
-    # Локальная статистика из SQLite
     local = STATE_MANAGER.get_local_stats()
-
-    # Статистика из Jira
     try:
         jira = await JIRA_CLIENT.get_project_stats(days=30)
     except Exception as e:
         logger.warning(f"stats: не удалось получить данные из Jira: {e}")
         jira = None
 
-    # ── Формируем сообщение ────────────────────────────────────────────
-    lines = ["📈 *Статистика TeamTrustGate*\n"]
-
-    # Общие цифры
-    lines.append(
-        f"*За последние 30 дней:*\n"
-        f"📋 Создано тикетов: *{local['this_month']}*\n"
-        f"📦 Всего через бота: *{local['total']}*"
-    )
-
-    if jira:
-        lines.append(
-            f"✅ Закрыто: *{jira['done']}*\n"
-            f"▶️ В работе: *{jira['in_progress']}*"
-        )
-
-    # Разбивка по приоритетам из Jira
-    if jira and jira["by_priority"]:
-        priority_order = ["Highest", "High", "Medium", "Low"]
-        emoji_map = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
-        lines.append("\n*Распределение по приоритетам:*")
-        for p in priority_order:
-            count = jira["by_priority"].get(p, 0)
-            if count:
-                bar = "█" * min(count, 10) + ("+" if count > 10 else "")
-                lines.append(f"{emoji_map.get(p, '⚪')} {p}: {bar} *{count}*")
-
-    # Разбивка по статусам из Jira
-    if jira and jira["by_status"]:
-        lines.append("\n*По статусам:*")
-        for status, count in sorted(jira["by_status"].items(), key=lambda x: -x[1]):
-            lines.append(f"  _{_escape_md(status)}_: {count}")
-
-    # Топ сейлзов
-    if local["top_users"]:
-        lines.append("\n*🏆 Топ сейлзов:*")
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-        for idx, u in enumerate(local["top_users"]):
-            medal = medals[idx] if idx < len(medals) else "  "
-            lines.append(f"{medal} @{_escape_md(u['username'])}: *{u['count']}* тикетов")
-
-    # Упавшие запросы
-    if local["failed"] > 0:
-        lines.append(
-            f"\n⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
-            f"(*{local['failed']}* всего)"
-        )
-
     await update.message.reply_text(
-        "\n".join(lines),
+        _build_stats_message(local, jira),
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "🔗 Открыть проект в Jira",
@@ -629,7 +669,6 @@ async def _process_request(update, chat_id, text, username, collected_answers):
     await _show_preview(update, chat_id, analysis, username, text, collected_answers, False, 1)
 
 async def _show_preview(update, chat_id, analysis, username, raw_text, collected_answers, forced, round_num):
-    """Показывает превью тикета для подтверждения перед созданием."""
     await update.message.reply_text("🔍 Проверяю на дубликаты...")
 
     try:
@@ -678,7 +717,6 @@ async def _show_preview(update, chat_id, analysis, username, raw_text, collected
     )
 
 async def _create_confirmed_ticket(message, chat_id, session, username):
-    """Создаёт тикет после подтверждения сейлзом."""
     data     = session.get("analysis_json", {})
     analysis = data.get("analysis", {})
     scoring  = data.get("scoring", {})
@@ -705,8 +743,8 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
         return
 
     STATE_MANAGER.clear_session(chat_id)
-    # Начинаем отслеживать тикет для уведомлений об изменении статуса
-    STATE_MANAGER.track_ticket(issue["key"], chat_id, username, status="")
+    # Сохраняем владельца (нормализованный username) для проверки прав
+    STATE_MANAGER.track_ticket(issue["key"], chat_id, _norm(username), status="")
     logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
 
     flag = "⚠️ Данных было недостаточно, тикет создан с пометкой.\n\n" if forced else ""
@@ -730,7 +768,7 @@ async def _create_raw_ticket(update, chat_id, text, username, error_msg):
             ["teamtrustgate", "raw-request", "sales-request"],
         )
         STATE_MANAGER.clear_session(chat_id)
-        STATE_MANAGER.track_ticket(issue["key"], chat_id, username, status="")
+        STATE_MANAGER.track_ticket(issue["key"], chat_id, _norm(username), status="")
         await update.message.reply_text(
             f"✅ *Сырой тикет создан:* [{issue['key']}]({issue['url']})\n"
             f"Продуктовая команда рассмотрит запрос вручную.",
@@ -762,14 +800,12 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # Фоновая задача: проверка изменений статуса каждые 5 минут
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(_poll_status_changes, interval=STATUS_POLL_INTERVAL, first=60)
         logger.info(f"Status polling запущен (каждые {STATUS_POLL_INTERVAL}с)")
     else:
-        logger.warning("JobQueue недоступна — уведомления об изменении статуса отключены. "
-                       "Установи: pip install 'python-telegram-bot[job-queue]'")
+        logger.warning("JobQueue недоступна. Установи: pip install 'python-telegram-bot[job-queue]'")
 
     logger.info("TeamTrustGate bot starting...")
     app.run_polling()
