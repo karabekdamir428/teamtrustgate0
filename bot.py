@@ -2,8 +2,12 @@
 Telegram → LLM → Jira
 """
 import asyncio
+import csv
+import io
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -445,7 +449,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list — мои последние 5 тикетов\n"
         "/delete TT-XX — удалить тикет (только свой)"
     )
-    admin_commands = "\n/stats — аналитика за 30 дней 👑" if is_admin else ""
+    admin_commands = "\n/stats — аналитика за 30 дней 👑\n/export [дней] — выгрузка в CSV 👑" if is_admin else ""
 
     await update.message.reply_text(
         "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
@@ -577,6 +581,76 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ]])
     )
+
+async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выгружает тикеты teamtrustgate в CSV файл. Только для админов."""
+    user = update.effective_user
+    if not _is_admin(user.username or ""):
+        await update.message.reply_text(
+            "\u274c Команда /export доступна только администраторам."
+        )
+        return
+
+    # Опциональный аргумент — количество дней (по умолчанию 90)
+    days = 90
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Использование: /export [дней]\nНапример: /export 30")
+            return
+
+    await update.message.reply_text(f"\U0001f4c1 Готовлю выгрузку за {days} дней...")
+
+    try:
+        issues = await JIRA_CLIENT.export_issues(days=days, max_results=200)
+    except Exception as e:
+        await update.message.reply_text(
+            f"\u274c Не удалось получить данные: {_escape_md(str(e)[:200])}"
+        )
+        return
+
+    if not issues:
+        await update.message.reply_text("\U0001f4ed Тикетов за этот период не найдено.")
+        return
+
+    # Формируем CSV в памяти
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["key", "summary", "status", "priority", "created", "updated", "labels"],
+        extrasaction="ignore",
+    )
+    # Заголовки на русском для удобства
+    output.write("\ufeff")  # BOM для корректного открытия в Excel
+    writer.writerow({
+        "key": "Тикет", "summary": "Описание", "status": "Статус",
+        "priority": "Приоритет", "created": "Создан", "updated": "Обновлён",
+        "labels": "Метки",
+    })
+    for issue in issues:
+        writer.writerow(issue)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    output.close()
+
+    # Отправляем файл
+    filename = f"teamtrustgate_export_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    bio = io.BytesIO(csv_bytes)
+    bio.name = filename
+
+    await update.message.reply_document(
+        document=bio,
+        filename=filename,
+        caption=(
+            f"\U0001f4ca *Выгрузка готова*\n"
+            f"Тикетов: *{len(issues)}*\n"
+            f"Период: последние *{days}* дней\n\n"
+            f"Файл можно открыть в Excel или Google Sheets."
+        ),
+        parse_mode="Markdown",
+    )
+    logger.info(f"export: {len(issues)} тикетов выгружено пользователем {user.username}")
 
 # ── Message handler ────────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -797,6 +871,7 @@ def main():
     app.add_handler(CommandHandler("list",   list_handler))
     app.add_handler(CommandHandler("delete", delete_handler))
     app.add_handler(CommandHandler("stats",  stats_handler))
+    app.add_handler(CommandHandler("export", export_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
