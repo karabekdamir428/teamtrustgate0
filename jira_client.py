@@ -126,6 +126,7 @@ class JiraClient:
         days: int = CONFIG.DEDUP_DAYS,
         max_results: int = 50,
     ) -> List[Dict[str, Any]]:
+        """Недавние открытые тикеты проекта для дедупликации."""
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
@@ -157,10 +158,14 @@ class JiraClient:
         username: str,
         max_results: int = 5,
     ) -> List[Dict[str, Any]]:
+        """
+        Последние тикеты проекта (для /list).
+        Фильтр по username убран — Jira Cloud плохо ищет по тексту описания.
+        Показываем последние тикеты проекта (фактически они и так от этого юзера
+        в небольшой команде). Точная привязка к владельцу — через SQLite tracking.
+        """
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
-            f'AND labels = "teamtrustgate" '
-            f'AND description ~ "{username}" '
             f"ORDER BY created DESC"
         )
         endpoint = (
@@ -181,14 +186,16 @@ class JiraClient:
             }
             for i in issues
         ]
-        logger.info(f"jira: найдено {len(result)} тикетов пользователя {username}")
+        logger.info(f"jira: найдено {len(result)} тикетов для /list")
         return result
 
     async def get_project_stats(self, days: int = 30) -> Dict[str, Any]:
-        """Возвращает статистику по тикетам teamtrustgate из Jira."""
+        """
+        Статистика по тикетам проекта из Jira.
+        Фильтр по лейблу убран — считаем все тикеты проекта за период.
+        """
         jql_all = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
-            f'AND labels = "teamtrustgate" '
             f"AND created >= -{days}d "
             f"ORDER BY created DESC"
         )
@@ -225,8 +232,8 @@ class JiraClient:
 
     async def export_issues(self, days: int = 90, max_results: int = 200) -> List[Dict[str, Any]]:
         """
-        Выгружает все тикеты проекта за период со всеми полями для CSV экспорта.
-        Намеренно без фильтра по лейблу — чтобы найти в том числе старые тикеты.
+        Выгружает все тикеты проекта за период для CSV экспорта.
+        Без фильтра по лейблу — чтобы найти все тикеты.
         """
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
