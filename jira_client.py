@@ -225,11 +225,11 @@ class JiraClient:
 
     async def export_issues(self, days: int = 90, max_results: int = 200) -> List[Dict[str, Any]]:
         """
-        Выгружает все тикеты teamtrustgate за период со всеми полями для CSV экспорта.
+        Выгружает все тикеты проекта за период со всеми полями для CSV экспорта.
+        Намеренно без фильтра по лейблу — чтобы найти в том числе старые тикеты.
         """
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
-            f'AND labels = "teamtrustgate" '
             f"AND created >= -{days}d "
             f"ORDER BY created DESC"
         )
