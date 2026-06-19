@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -55,6 +55,11 @@ def _load_prompt(name: str) -> str:
     )
 
 EXTRACTION_PROMPT = _load_prompt("extraction")
+
+def _prompt_with_today() -> str:
+    """Подставляет сегодняшнюю дату в промпт чтобы LLM считал относительные сроки."""
+    today = date.today().isoformat()
+    return EXTRACTION_PROMPT.replace("{TODAY}", today)
 
 # ── Роли и права доступа ──────────────────────────────────────────────────
 def _norm(username: str) -> str:
@@ -142,11 +147,14 @@ def _preview_keyboard() -> InlineKeyboardMarkup:
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, requested_by: str) -> str:
+    deadline = _parse_deadline(analysis)
+    deadline_line = f"*Срок исполнения:* {deadline}\n" if deadline else ""
     return (
         f"*Проблема:* {analysis.get('problem_statement', '')}\n"
         f"*Контекст клиента:* {analysis.get('client_context', '')}\n"
         f"*Потенциальный ROI:* {analysis.get('revenue_at_risk', 0)}/10\n"
         f"*Охват:* {analysis.get('reach', 'unknown')}\n"
+        f"{deadline_line}"
         f"*Инициатор:* {requested_by}\n"
         f"*Оригинальный запрос:* {raw_text}\n\n"
         f"*AI-скоринг:* {scoring.get('total_score', 0)} ({scoring.get('priority', 'Low')})\n"
@@ -165,15 +173,58 @@ def _priority_emoji(priority: str) -> str:
 def _reach_label(reach: str) -> str:
     return {"one_client": "Один клиент", "segment": "Сегмент", "all_clients": "Все клиенты"}.get(reach, reach)
 
+def _parse_deadline(analysis: dict) -> str | None:
+    """
+    Валидирует дедлайн из анализа LLM.
+    Возвращает дату в формате YYYY-MM-DD или None если дедлайна нет/он невалиден.
+    """
+    raw = analysis.get("deadline")
+    if not raw or raw in ("null", "None", ""):
+        return None
+    try:
+        # Проверяем что это валидная дата формата YYYY-MM-DD
+        parsed = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+        # Игнорируем даты в прошлом (LLM мог ошибиться)
+        if parsed < date.today():
+            logger.warning(f"deadline в прошлом, игнорирую: {raw}")
+            return None
+        return parsed.isoformat()
+    except (ValueError, TypeError):
+        logger.warning(f"не удалось распарсить deadline: {raw}")
+        return None
+
+def _deadline_label(deadline: str | None) -> str:
+    """Человекочитаемая метка дедлайна с эмодзи срочности."""
+    if not deadline:
+        return "не указан"
+    try:
+        d = datetime.strptime(deadline, "%Y-%m-%d").date()
+        days_left = (d - date.today()).days
+        date_str = d.strftime("%d.%m.%Y")
+        if days_left < 0:
+            return f"⚠️ {date_str} (просрочен)"
+        elif days_left == 0:
+            return f"🔥 {date_str} (сегодня!)"
+        elif days_left <= 3:
+            return f"🔥 {date_str} (через {days_left} дн.)"
+        elif days_left <= 7:
+            return f"⏰ {date_str} (через {days_left} дн.)"
+        else:
+            return f"📅 {date_str} (через {days_left} дн.)"
+    except (ValueError, TypeError):
+        return str(deadline)
+
 def _build_preview(analysis: dict, scoring: dict) -> str:
     priority = scoring.get("priority", "Low")
     reach    = analysis.get("reach", "unknown")
+    deadline = _parse_deadline(analysis)
     return (
         "🤖 *Вот что я понял из запроса:*\n\n"
         f"📋 *Проблема:*\n{_escape_md(analysis.get('problem_statement', ''))}\n\n"
         f"👤 *Клиент:* {_escape_md(analysis.get('client_context', 'не указан'))}\n"
         f"💰 *Риск потери выручки:* {analysis.get('revenue_at_risk', 0)}/10\n"
         f"📊 *Охват:* {_reach_label(reach)}\n"
+        f"📆 *Срок:* {_deadline_label(deadline)}\n"
         f"🎯 *Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)} "
         f"({scoring.get('total_score', 0)}/400)\n\n"
         "Всё верно? Создаём тикет?"
@@ -746,7 +797,7 @@ async def _handle_clarification(update, chat_id, text, username, session):
     await update.message.reply_text("⏳ Анализирую уточнения...")
 
     try:
-        analysis = await llm.analyze(original, collected, EXTRACTION_PROMPT)
+        analysis = await llm.analyze(original, collected, _prompt_with_today())
     except Exception as e:
         logger.error(f"ai_clarification_error: {e}")
         full_raw = f"Оригинальный запрос: {original}\nУточнения: " + " | ".join(collected)
@@ -777,7 +828,7 @@ async def _process_request(update, chat_id, text, username, collected_answers):
     await update.message.reply_text("⏳ Анализирую запрос...")
 
     try:
-        analysis = await llm.analyze(text, collected_answers, EXTRACTION_PROMPT)
+        analysis = await llm.analyze(text, collected_answers, _prompt_with_today())
     except Exception as e:
         logger.error(f"ai_analysis_error: {e}")
         await _create_raw_ticket(update, chat_id, text, username, str(e))
@@ -861,12 +912,13 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
     summary     = analysis.get("problem_statement", "Sales request")[:255]
     description = _build_jira_description(analysis, scoring, raw_text, username)
     priority    = scoring.get("priority", "Low")
+    due_date    = _parse_deadline(analysis)
     labels      = ["teamtrustgate", "ai-generated", "sales-request"]
     if forced:
         labels.append("insufficient-data")
 
     try:
-        issue = await JIRA_CLIENT.create_issue(summary, description, priority, labels)
+        issue = await JIRA_CLIENT.create_issue(summary, description, priority, labels, due_date=due_date)
     except Exception as e:
         logger.error(f"jira_create_error: {e}")
         STATE_MANAGER.save_failed_request(chat_id, username, raw_text, analysis, str(e))
@@ -882,6 +934,7 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
     STATE_MANAGER.track_ticket(issue["key"], chat_id, _norm(username), status="")
     logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
 
+    deadline_line = f"*Срок:* {_deadline_label(due_date)}\n" if due_date else ""
     flag = "⚠️ Данных было недостаточно, тикет создан с пометкой.\n\n" if forced else ""
     await message.reply_text(
         f"{flag}"
@@ -889,6 +942,7 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
         f"*Приоритет:* {_priority_emoji(priority)} {_escape_md(priority)}\n"
         f"*Скоринг:* {scoring.get('total_score', 0)}/400\n"
         f"*Охват:* {_escape_md(analysis.get('reach', 'unknown'))}\n"
+        f"{deadline_line}"
         f"*Я уведомлю тебя когда статус изменится.*",
         reply_markup=_ticket_keyboard(issue["key"], is_admin=_is_admin(username)),
     )
