@@ -499,6 +499,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     base_commands = (
         "/start — начать\n"
+        "/help — как пользоваться ботом\n"
         "/cancel — отменить текущую сессию\n"
         "/status TT-XX — статус тикета\n"
         "/list — мои последние 5 тикетов"
@@ -715,6 +716,71 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     logger.info(f"export: {len(issues)} тикетов выгружено пользователем {user.username}")
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подробная инструкция по использованию бота. Разная для сейлза и админа."""
+    user = update.effective_user
+    if not _is_allowed(user.username or ""):
+        await update.message.reply_text("❌ Доступ ограничен.")
+        return
+
+    is_admin = _is_admin(user.username or "")
+
+    # Общая часть — как создавать запросы
+    base = (
+        "📖 *Как пользоваться TeamTrustGate*\n\n"
+        "Я превращаю твоё описание запроса клиента в структурированный тикет "
+        "для продуктовой команды. Просто пиши обычным языком — я сам разберусь.\n\n"
+        "*Как создать запрос:*\n"
+        "Опиши что просит клиент своими словами. Чем больше деталей — тем точнее "
+        "приоритет. Полезно указать:\n"
+        "• 🏢 Название и размер клиента\n"
+        "• 💰 Сумму контракта или риск для выручки\n"
+        "• 📆 Срок (если есть дедлайн)\n"
+        "• 🎯 Что именно нужно клиенту\n\n"
+        "*Пример хорошего запроса:*\n"
+        "_«Альфа-Банк просит выгрузку отчётов в Excel. Контракт $150k, "
+        "2000 пользователей. Нужно к концу месяца, иначе не продлят.»_\n\n"
+        "*Что произойдёт дальше:*\n"
+        "1️⃣ Я проанализирую запрос\n"
+        "2️⃣ Если данных мало — задам уточняющий вопрос\n"
+        "3️⃣ Покажу превью: проблема, клиент, приоритет, срок\n"
+        "4️⃣ Ты подтвердишь — и я создам тикет в Jira\n"
+        "5️⃣ Я уведомлю тебя когда статус изменится\n\n"
+        "*Кнопки под превью:*\n"
+        "✅ Создать — подтвердить и создать тикет\n"
+        "✏️ Уточнить — дополнить или исправить\n"
+        "❌ Отменить — отменить создание\n\n"
+        "*Если передумал* — команда /cancel сбросит текущий запрос.\n\n"
+    )
+
+    sales_commands = (
+        "*Твои команды:*\n"
+        "/status TT-42 — узнать статус тикета\n"
+        "/list — посмотреть свои последние тикеты\n"
+        "/cancel — отменить текущий запрос\n"
+        "/help — эта справка\n\n"
+        "💡 _Статусы тикетов двигает продуктовая команда. "
+        "Ты получишь уведомление как только что-то изменится._"
+    )
+
+    admin_commands = (
+        "*Команды администратора:*\n"
+        "/status TT-42 — статус тикета (+ управление)\n"
+        "/list — последние тикеты\n"
+        "/delete TT-42 — удалить тикет\n"
+        "/stats — аналитика за 30 дней\n"
+        "/export [дней] — выгрузка в CSV\n"
+        "/cancel — отменить текущий запрос\n"
+        "/help — эта справка\n\n"
+        "*Управление тикетами:*\n"
+        "Под каждым тикетом есть кнопки смены статуса "
+        "(▶️ В работу / ✅ Готово / 🔄 На проверку / 🚫 Отклонить). "
+        "Сейлзы их не видят — двигать тикеты можешь только ты."
+    )
+
+    text = base + (admin_commands if is_admin else sales_commands)
+    await update.message.reply_text(text)
 
 async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Диагностика Jira API. Только для админов. Показывает сырой ответ."""
@@ -981,6 +1047,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start",  start_handler))
+    app.add_handler(CommandHandler("help",   help_handler))
     app.add_handler(CommandHandler("cancel", cancel_handler))
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("list",   list_handler))
