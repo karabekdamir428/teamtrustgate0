@@ -1,18 +1,22 @@
-"""Async Jira REST API v2 client with retries and circuit breaker."""
+"""Async Jira REST API client with retries and circuit breaker.
+
+ВАЖНО: Jira Cloud удалила старый /rest/api/2/search (HTTP 410).
+Поиск мигрирован на новый /rest/api/3/search/jql (POST с телом запроса).
+Остальные операции (issue, transitions, comment) работают на /rest/api/2.
+"""
 import base64
 import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote
 
 import aiohttp
 from config import CONFIG
 
 logger = logging.getLogger("teamtrustgate")
 
-_NON_RETRYABLE_STATUSES = {400, 401, 403, 404}
+_NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 410}
 
 _PRIORITY_MAP = {
     "Highest": "Highest",
@@ -58,7 +62,10 @@ class CircuitBreaker:
 
 class JiraClient:
     def __init__(self):
+        # base_url для операций над тикетами (issue, transitions, comment)
         self.base_url = f"{CONFIG.JIRA_URL}/rest/api/2"
+        # base для поиска — новый эндпоинт v3 (старый v2/search удалён)
+        self.search_base = f"{CONFIG.JIRA_URL}/rest/api/3"
         auth_str = f"{CONFIG.JIRA_EMAIL}:{CONFIG.JIRA_API_TOKEN}"
         self._headers = {
             "Authorization": "Basic " + base64.b64encode(auth_str.encode()).decode(),
@@ -73,14 +80,19 @@ class JiraClient:
         endpoint: str,
         json_data: Optional[dict] = None,
         retries: int = 3,
+        base: Optional[str] = None,
     ) -> tuple[int, str]:
+        """
+        Универсальный запрос к Jira.
+        base — переопределение base_url (для поиска используем search_base).
+        """
         if self._circuit.is_open():
             raise RuntimeError(
                 "Jira circuit breaker активен — сервис временно недоступен. "
                 "Попробуйте через несколько минут."
             )
 
-        url = f"{self.base_url}{endpoint}"
+        url = f"{base or self.base_url}{endpoint}"
         last_err: Optional[Exception] = None
 
         for attempt in range(retries):
@@ -121,6 +133,23 @@ class JiraClient:
 
         raise RuntimeError(f"Jira недоступна после {retries} попыток: {last_err}")
 
+    async def _search(self, jql: str, fields: List[str], max_results: int = 50) -> List[Dict[str, Any]]:
+        """
+        Поиск через новый эндпоинт /rest/api/3/search/jql.
+        Поля и JQL передаются в теле POST-запроса (не в URL).
+        Возвращает список issues.
+        """
+        payload = {
+            "jql": jql,
+            "fields": fields,
+            "maxResults": max_results,
+        }
+        status, text = await self._request(
+            "POST", "/search/jql", json_data=payload, base=self.search_base
+        )
+        data = json.loads(text)
+        return data.get("issues", [])
+
     async def search_recent_issues(
         self,
         days: int = CONFIG.DEDUP_DAYS,
@@ -133,15 +162,7 @@ class JiraClient:
             f"AND status != Done "
             f"ORDER BY created DESC"
         )
-        endpoint = (
-            f"/search"
-            f"?jql={quote(jql, safe='')}"
-            f"&fields=summary,description,key"
-            f"&maxResults={max_results}"
-        )
-        status, text = await self._request("GET", endpoint)
-        data = json.loads(text)
-        issues = data.get("issues", [])
+        issues = await self._search(jql, ["summary", "description", "key"], max_results)
         result = [
             {
                 "key": i["key"],
@@ -158,31 +179,15 @@ class JiraClient:
         username: str,
         max_results: int = 5,
     ) -> List[Dict[str, Any]]:
-        """
-        Последние тикеты проекта (для /list).
-        Фильтр по username убран — Jira Cloud плохо ищет по тексту описания.
-        Показываем последние тикеты проекта (фактически они и так от этого юзера
-        в небольшой команде). Точная привязка к владельцу — через SQLite tracking.
-        """
-        jql = (
-            f"project={CONFIG.JIRA_PROJECT_KEY} "
-            f"ORDER BY created DESC"
-        )
-        endpoint = (
-            f"/search"
-            f"?jql={quote(jql, safe='')}"
-            f"&fields=summary,status,priority,key"
-            f"&maxResults={max_results}"
-        )
-        status, text = await self._request("GET", endpoint)
-        data = json.loads(text)
-        issues = data.get("issues", [])
+        """Последние тикеты проекта (для /list)."""
+        jql = f"project={CONFIG.JIRA_PROJECT_KEY} ORDER BY created DESC"
+        issues = await self._search(jql, ["summary", "status", "priority", "key"], max_results)
         result = [
             {
                 "key": i["key"],
                 "summary": i["fields"].get("summary", ""),
                 "status":  i["fields"].get("status", {}).get("name", "—"),
-                "priority": i["fields"].get("priority", {}).get("name", "Low"),
+                "priority": (i["fields"].get("priority") or {}).get("name", "Low"),
             }
             for i in issues
         ]
@@ -190,33 +195,22 @@ class JiraClient:
         return result
 
     async def get_project_stats(self, days: int = 30) -> Dict[str, Any]:
-        """
-        Статистика по тикетам проекта из Jira.
-        Фильтр по лейблу убран — считаем все тикеты проекта за период.
-        """
-        jql_all = (
+        """Статистика по тикетам проекта из Jira."""
+        jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
             f"ORDER BY created DESC"
         )
-        endpoint = (
-            f"/search"
-            f"?jql={quote(jql_all, safe='')}"
-            f"&fields=priority,status,created"
-            f"&maxResults=200"
-        )
-        _, text = await self._request("GET", endpoint)
-        data   = json.loads(text)
-        issues = data.get("issues", [])
-        total  = data.get("total", len(issues))
+        issues = await self._search(jql, ["priority", "status", "created"], 200)
+        total = len(issues)
 
         by_priority: Dict[str, int] = {}
         by_status:   Dict[str, int] = {}
         done_count = 0
 
         for i in issues:
-            p = i["fields"].get("priority", {}).get("name", "Low")
-            s = i["fields"].get("status",   {}).get("name", "—")
+            p = (i["fields"].get("priority") or {}).get("name", "Low")
+            s = (i["fields"].get("status")   or {}).get("name", "—")
             by_priority[p] = by_priority.get(p, 0) + 1
             by_status[s]   = by_status.get(s, 0) + 1
             if s.lower() in ("done", "готово", "closed", "resolved"):
@@ -231,33 +225,23 @@ class JiraClient:
         }
 
     async def export_issues(self, days: int = 90, max_results: int = 200) -> List[Dict[str, Any]]:
-        """
-        Выгружает все тикеты проекта за период для CSV экспорта.
-        Без фильтра по лейблу — чтобы найти все тикеты.
-        """
+        """Выгружает все тикеты проекта за период для CSV экспорта."""
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
             f"ORDER BY created DESC"
         )
-        endpoint = (
-            f"/search"
-            f"?jql={quote(jql, safe='')}"
-            f"&fields=summary,status,priority,created,updated,labels"
-            f"&maxResults={max_results}"
+        issues = await self._search(
+            jql, ["summary", "status", "priority", "created", "updated", "labels"], max_results
         )
-        _, text = await self._request("GET", endpoint)
-        data   = json.loads(text)
-        issues = data.get("issues", [])
-
         result = []
         for i in issues:
             f = i["fields"]
             result.append({
                 "key":      i["key"],
                 "summary":  f.get("summary", ""),
-                "status":   f.get("status", {}).get("name", ""),
-                "priority": f.get("priority", {}).get("name", ""),
+                "status":   (f.get("status") or {}).get("name", ""),
+                "priority": (f.get("priority") or {}).get("name", ""),
                 "created":  (f.get("created") or "")[:10],
                 "updated":  (f.get("updated") or "")[:10],
                 "labels":   ", ".join(f.get("labels", [])),
@@ -320,6 +304,7 @@ def _status_message(status: int, text: str) -> str:
         401: "Ошибка авторизации — проверьте JIRA_EMAIL и JIRA_API_TOKEN",
         403: "Нет прав доступа — проверьте права токена в Jira",
         404: "Ресурс не найден — проверьте JIRA_URL и JIRA_PROJECT_KEY",
+        410: f"API endpoint удалён: {text[:300]}",
     }
     return messages.get(status, text[:300])
 
