@@ -255,23 +255,26 @@ class JiraClient:
         description: str,
         priority: str,
         labels: list,
+        due_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         jira_priority = _PRIORITY_MAP.get(priority, "Low")
-        payload = {
-            "fields": {
-                "project":     {"key": CONFIG.JIRA_PROJECT_KEY},
-                "summary":     summary[:255],
-                "description": description,
-                "issuetype":   {"name": "Story"},
-                "priority":    {"name": jira_priority},
-                "labels":      labels,
-            }
+        fields = {
+            "project":     {"key": CONFIG.JIRA_PROJECT_KEY},
+            "summary":     summary[:255],
+            "description": description,
+            "issuetype":   {"name": "Story"},
+            "priority":    {"name": jira_priority},
+            "labels":      labels,
         }
+        # Срок исполнения — нативное поле Jira duedate (формат YYYY-MM-DD)
+        if due_date:
+            fields["duedate"] = due_date
+        payload = {"fields": fields}
         status, text = await self._request("POST", "/issue", payload)
         data = json.loads(text)
         key  = data.get("key")
         url  = f"{CONFIG.JIRA_URL}/browse/{key}"
-        logger.info(f"jira: тикет создан {key}")
+        logger.info(f"jira: тикет создан {key}" + (f" (due {due_date})" if due_date else ""))
         return {"key": key, "url": url}
 
     async def delete_issue(self, issue_key: str) -> None:
