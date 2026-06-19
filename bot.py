@@ -652,6 +652,54 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     logger.info(f"export: {len(issues)} тикетов выгружено пользователем {user.username}")
 
+async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Jira API. Только для админов. Показывает сырой ответ."""
+    user = update.effective_user
+    if not _is_admin(user.username or ""):
+        await update.message.reply_text("\u274c Только для админов.")
+        return
+
+    await update.message.reply_text("\U0001f50d Тестирую Jira API напрямую...")
+
+    # Тест 1: простейший запрос — все тикеты проекта без фильтров
+    from urllib.parse import quote
+    jql = f"project={CONFIG.JIRA_PROJECT_KEY} ORDER BY created DESC"
+    endpoint = f"/search?jql={quote(jql, safe='')}&fields=summary,key&maxResults=5"
+
+    report = ["\U0001f527 *DEBUG: Jira API*\n"]
+    report.append(f"*PROJECT_KEY:* `{CONFIG.JIRA_PROJECT_KEY}`")
+    report.append(f"*JIRA_URL:* `{CONFIG.JIRA_URL}`")
+    report.append(f"*base_url:* `{JIRA_CLIENT.base_url}`")
+    report.append(f"*JQL:* `{jql}`\n")
+
+    try:
+        status, text = await JIRA_CLIENT._request("GET", endpoint)
+        report.append(f"*HTTP статус:* `{status}`")
+
+        try:
+            data = json.loads(text)
+            total = data.get("total", "нет поля total")
+            issues = data.get("issues", [])
+            report.append(f"*total:* `{total}`")
+            report.append(f"*issues в ответе:* `{len(issues)}`")
+
+            if issues:
+                report.append("\n*Найденные тикеты:*")
+                for i in issues[:5]:
+                    report.append(f"  • {i.get('key')} — {i.get('fields', {}).get('summary', '')[:40]}")
+            else:
+                # Показываем сырой ответ если тикетов нет
+                report.append(f"\n*Сырой ответ (первые 500):*\n`{text[:500]}`")
+        except json.JSONDecodeError:
+            report.append(f"\n*Не JSON. Сырой ответ:*\n`{text[:500]}`")
+
+    except Exception as e:
+        report.append(f"\n\u274c *Ошибка запроса:*\n`{str(e)[:400]}`")
+
+    msg = "\n".join(report)
+    # Telegram лимит 4096
+    await update.message.reply_text(msg[:4000])
+
 # ── Message handler ────────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user     = update.effective_user
@@ -872,6 +920,7 @@ def main():
     app.add_handler(CommandHandler("delete", delete_handler))
     app.add_handler(CommandHandler("stats",  stats_handler))
     app.add_handler(CommandHandler("export", export_handler))
+    app.add_handler(CommandHandler("debug",  debug_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
