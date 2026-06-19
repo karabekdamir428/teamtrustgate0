@@ -74,35 +74,32 @@ def _is_admin(username: str) -> bool:
         return False  # список пуст — никто не админ
     return _norm(username) in CONFIG.ADMIN_USERNAMES
 
-def _can_manage_ticket(username: str, issue_key: str) -> bool:
-    """
-    Может ли пользователь управлять тикетом (удалять, менять статус)?
-    - Админ может управлять любым тикетом
-    - Сейлз — только своим (созданным им)
-    - Если владелец неизвестен (старый тикет) — только админ
-    """
-    if _is_admin(username):
-        return True
-    owner = STATE_MANAGER.get_ticket_owner(issue_key)
-    if owner is None:
-        return False  # неизвестный владелец — только админ может
-    return owner == _norm(username)
-
 # ── Keyboard builders ─────────────────────────────────────────────────────
-def _ticket_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _ticket_keyboard(issue_key: str, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """
+    Кнопки под тикетом.
+    Сейлз видит только статус и ссылку. Управление (статусы, удаление) — только админу.
+    """
+    rows = [
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
-        [
-            InlineKeyboardButton("📊 Статус",   callback_data=f"status:{issue_key}"),
-            InlineKeyboardButton("🗑 Удалить",  callback_data=f"delete_confirm:{issue_key}"),
-        ],
-        [
+        [InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}")],
+    ]
+    if is_admin:
+        rows.append([
             InlineKeyboardButton("▶️ В работу", callback_data=f"transition:in_progress:{issue_key}"),
             InlineKeyboardButton("✅ Готово",    callback_data=f"transition:done:{issue_key}"),
-        ],
-    ])
+        ])
+        rows.append([
+            InlineKeyboardButton("🔄 На проверку", callback_data=f"transition:review:{issue_key}"),
+            InlineKeyboardButton("🚫 Отклонить",   callback_data=f"transition:reject:{issue_key}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_confirm:{issue_key}"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
 def _status_keyboard(issue_key: str) -> InlineKeyboardMarkup:
+    """Полная клавиатура управления статусом — только для админов."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
         [
@@ -114,6 +111,12 @@ def _status_keyboard(issue_key: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚫 Отклонить",   callback_data=f"transition:reject:{issue_key}"),
         ],
         [InlineKeyboardButton("🗑 Удалить",        callback_data=f"delete_confirm:{issue_key}")],
+    ])
+
+def _view_only_keyboard(issue_key: str) -> InlineKeyboardMarkup:
+    """Клавиатура только для просмотра (сейлз) — без управления."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
     ])
 
 def _confirm_delete_keyboard(issue_key: str) -> InlineKeyboardMarkup:
@@ -322,10 +325,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("transition:"):
         _, transition_type, issue_key = data.split(":", 2)
-        # Проверка прав: управлять статусом может владелец или админ
-        if not _can_manage_ticket(username, issue_key):
+        # Смена статуса — работа продуктовой команды (только админы)
+        if not _is_admin(username):
             await query.message.reply_text(
-                "❌ Недостаточно прав. Менять статус может только создатель тикета или администратор."
+                "❌ Менять статус тикета может только продуктовая команда (администратор).\n"
+                "Ты получишь уведомление когда статус изменится."
             )
             return
         await _handle_transition(query, issue_key, transition_type, username)
@@ -340,8 +344,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_name = d["fields"]["status"]["name"]
             summary     = d["fields"]["summary"]
             priority    = d["fields"].get("priority", {}).get("name", "—")
-            # Кнопки управления показываем только если есть права
-            kb = _status_keyboard(issue_key) if _can_manage_ticket(username, issue_key) else None
+            # Управление статусом — только админам, сейлзу только просмотр
+            kb = _status_keyboard(issue_key) if _is_admin(username) else _view_only_keyboard(issue_key)
             await query.message.reply_text(
                 f"📋 *{issue_key}*\n"
                 f"*Статус:* {_escape_md(status_name)}\n"
@@ -356,10 +360,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("delete_confirm:"):
         issue_key = data.split(":", 1)[1]
-        # Проверка прав на удаление
-        if not _can_manage_ticket(username, issue_key):
+        # Удаление — только админ
+        if not _is_admin(username):
             await query.message.reply_text(
-                "❌ Недостаточно прав. Удалить тикет может только его создатель или администратор."
+                "❌ Удалить тикет может только администратор."
             )
             return
         await query.message.reply_text(
@@ -370,8 +374,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("delete_yes:"):
         issue_key = data.split(":", 1)[1]
         # Повторная проверка прав (защита от устаревших кнопок)
-        if not _can_manage_ticket(username, issue_key):
-            await query.message.reply_text("❌ Недостаточно прав.")
+        if not _is_admin(username):
+            await query.message.reply_text("❌ Удалить тикет может только администратор.")
             return
         try:
             await JIRA_CLIENT.delete_issue(issue_key)
@@ -446,16 +450,25 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — начать\n"
         "/cancel — отменить текущую сессию\n"
         "/status TT-XX — статус тикета\n"
-        "/list — мои последние 5 тикетов\n"
-        "/delete TT-XX — удалить тикет (только свой)"
+        "/list — мои последние 5 тикетов"
     )
-    admin_commands = "\n/stats — аналитика за 30 дней 👑\n/export [дней] — выгрузка в CSV 👑" if is_admin else ""
+    admin_commands = (
+        "\n/delete TT-XX — удалить тикет 👑"
+        "\n/stats — аналитика за 30 дней 👑"
+        "\n/export [дней] — выгрузка в CSV 👑"
+    ) if is_admin else ""
+
+    role_note = (
+        "Ты можешь создавать тикеты, смотреть и управлять любыми из них.\n\n"
+        if is_admin else
+        "Просто опиши запрос клиента своими словами — я создам тикет для продуктовой команды. "
+        "Двигать тикет по статусам будет продакт-команда, а я уведомлю тебя об изменениях.\n\n"
+    )
 
     await update.message.reply_text(
         "👋 Привет! Я TeamTrustGate — агент обработки клиентских запросов.\n\n"
         f"{role_line}\n\n"
-        "Просто опиши запрос клиента своими словами, и я создам тикет для продуктовой команды.\n\n"
-        "Я также буду присылать уведомления когда статус твоего тикета изменится.\n\n"
+        f"{role_note}"
         "Команды:\n"
         f"{base_commands}{admin_commands}"
     )
@@ -484,7 +497,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_name = d["fields"]["status"]["name"]
         summary     = d["fields"]["summary"]
         priority    = d["fields"].get("priority", {}).get("name", "—")
-        kb = _status_keyboard(issue_key) if _can_manage_ticket(username, issue_key) else None
+        kb = _status_keyboard(issue_key) if _is_admin(username) else _view_only_keyboard(issue_key)
         await update.message.reply_text(
             f"📋 *{issue_key}*\n"
             f"*Статус:* {_escape_md(status_name)}\n"
@@ -543,10 +556,10 @@ async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /delete TT-42")
         return
     issue_key = args[0].upper()
-    # Проверка прав
-    if not _can_manage_ticket(username, issue_key):
+    # Удаление — только админ
+    if not _is_admin(username):
         await update.message.reply_text(
-            "❌ Недостаточно прав. Удалить тикет может только его создатель или администратор."
+            "❌ Удалить тикет может только администратор."
         )
         return
     await update.message.reply_text(
@@ -877,7 +890,7 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
         f"*Скоринг:* {scoring.get('total_score', 0)}/400\n"
         f"*Охват:* {_escape_md(analysis.get('reach', 'unknown'))}\n"
         f"*Я уведомлю тебя когда статус изменится.*",
-        reply_markup=_ticket_keyboard(issue["key"]),
+        reply_markup=_ticket_keyboard(issue["key"], is_admin=_is_admin(username)),
     )
 
 async def _create_raw_ticket(update, chat_id, text, username, error_msg):
@@ -894,7 +907,7 @@ async def _create_raw_ticket(update, chat_id, text, username, error_msg):
         await update.message.reply_text(
             f"✅ *Сырой тикет создан:* [{issue['key']}]({issue['url']})\n"
             f"Продуктовая команда рассмотрит запрос вручную.",
-            reply_markup=_ticket_keyboard(issue["key"]),
+            reply_markup=_ticket_keyboard(issue["key"], is_admin=_is_admin(username)),
         )
     except Exception as e:
         STATE_MANAGER.save_failed_request(chat_id, username, text, None, str(e))
