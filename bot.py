@@ -94,7 +94,10 @@ def _ticket_keyboard(issue_key: str, is_admin: bool = False) -> InlineKeyboardMa
     """
     rows = [
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
-        [InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}")],
+        [
+            InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
+            InlineKeyboardButton("💬 Комментарий", callback_data=f"comment:{issue_key}"),
+        ],
     ]
     if is_admin:
         rows.append([
@@ -114,6 +117,7 @@ def _status_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     """Полная клавиатура управления статусом — только для админов."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
+        [InlineKeyboardButton("💬 Комментарий", callback_data=f"comment:{issue_key}")],
         [
             InlineKeyboardButton("▶️ В работу",    callback_data=f"transition:in_progress:{issue_key}"),
             InlineKeyboardButton("✅ Готово",       callback_data=f"transition:done:{issue_key}"),
@@ -126,9 +130,10 @@ def _status_keyboard(issue_key: str) -> InlineKeyboardMarkup:
     ])
 
 def _view_only_keyboard(issue_key: str) -> InlineKeyboardMarkup:
-    """Клавиатура только для просмотра (сейлз) — без управления."""
+    """Клавиатура только для просмотра (сейлз) — без управления, но с комментарием."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}")],
+        [InlineKeyboardButton("💬 Комментарий", callback_data=f"comment:{issue_key}")],
     ])
 
 def _confirm_delete_keyboard(issue_key: str) -> InlineKeyboardMarkup:
@@ -564,6 +569,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("delete_no:"):
         await query.message.edit_text("✅ Удаление отменено.")
 
+    elif data.startswith("comment:"):
+        issue_key = data.split(":", 1)[1]
+        # Запоминаем в сессии что ждём текст комментария к этому тикету
+        STATE_MANAGER.create_session(chat_id, "")
+        STATE_MANAGER.update_session(
+            chat_id, "awaiting_comment", [], 0, {"comment_issue_key": issue_key}
+        )
+        await query.message.reply_text(
+            f"💬 Напиши комментарий к тикету *{issue_key}* — я добавлю его в Jira.\n"
+            f"_Для отмены — /cancel_"
+        )
+
 async def _handle_transition(query, issue_key: str, transition_type: str, username: str):
     try:
         _, text     = await JIRA_CLIENT._request("GET", f"/issue/{issue_key}/transitions")
@@ -973,11 +990,48 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_clarification(update, chat_id, text, username, session)
         return
 
+    if session and session["state"] == "awaiting_comment":
+        await _handle_comment(update, chat_id, text, username, session)
+        return
+
     logger.info(f"request_received chat_id={chat_id} msg_len={len(text)}")
     STATE_MANAGER.create_session(chat_id, text)
     await _process_request(update, chat_id, text, username, collected_answers=[])
 
 # ── Core logic ─────────────────────────────────────────────────────────────
+async def _handle_comment(update, chat_id, text, username, session):
+    """Добавляет текст сообщения комментарием к тикету из сессии."""
+    data = session.get("analysis_json") or {}
+    issue_key = data.get("comment_issue_key")
+
+    if not issue_key:
+        STATE_MANAGER.clear_session(chat_id)
+        await update.message.reply_text("⚠️ Не понял к какому тикету комментарий. Попробуй ещё раз.")
+        return
+
+    await update.message.reply_text("💬 Добавляю комментарий...")
+
+    comment_text = f"[Telegram] @{username}: {text}"
+    try:
+        await JIRA_CLIENT.add_comment(issue_key, comment_text)
+    except Exception as e:
+        logger.error(f"comment_add_error: {e}")
+        STATE_MANAGER.clear_session(chat_id)
+        await update.message.reply_text(
+            f"❌ Не удалось добавить комментарий: {_escape_md(str(e)[:200])}"
+        )
+        return
+
+    STATE_MANAGER.clear_session(chat_id)
+    logger.info(f"comment_added key={issue_key} by={username}")
+    await update.message.reply_text(
+        f"✅ Комментарий добавлен к тикету *{issue_key}*.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔗 Открыть в Jira", url=f"{CONFIG.JIRA_URL}/browse/{issue_key}"),
+            InlineKeyboardButton("📊 Статус", callback_data=f"status:{issue_key}"),
+        ]])
+    )
+
 async def _handle_clarification(update, chat_id, text, username, session):
     collected = session["collected_answers"] + [text]
     round_num = session["round"] + 1
