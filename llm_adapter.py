@@ -68,13 +68,19 @@ class LLMProvider(ABC):
         """
         Парсит ответ batch-дедупликации.
         Возвращает список всех найденных ключей-дубликатов (не только первый).
+        Валидирует ключи против списка кандидатов — выдуманные LLM ключи отбрасываются.
         """
+        valid_keys = {t["key"] for t in candidates}
         try:
             result = self._extract_json(text)
             duplicates = result.get("duplicates", [])
             if isinstance(duplicates, list):
                 # Фикс пункта 5: не логируем ключи — только факт нахождения
-                valid = [k for k in duplicates if isinstance(k, str)]
+                # Защита от галлюцинаций: оставляем только реально существующие ключи
+                valid = [k for k in duplicates if isinstance(k, str) and k in valid_keys]
+                hallucinated = [k for k in duplicates if isinstance(k, str) and k not in valid_keys]
+                if hallucinated:
+                    logger.warning(f"dedup: LLM вернул {len(hallucinated)} несуществующих ключей, отброшены")
                 return valid
         except ValueError:
             # Fallback: ищем ключи тикетов прямо в тексте
