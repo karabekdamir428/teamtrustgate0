@@ -10,6 +10,10 @@ import os
 import tempfile
 from datetime import datetime, timezone, timedelta, date
 
+import matplotlib
+matplotlib.use("Agg")  # без GUI — для сервера
+import matplotlib.pyplot as plt
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -278,6 +282,68 @@ def _build_stats_message(local: dict, jira: dict | None) -> str:
             f"(*{local['failed']}* всего)"
         )
     return "\n".join(parts)
+
+
+def _generate_stats_chart(jira: dict | None) -> io.BytesIO | None:
+    """
+    Генерирует PNG с диаграммами: приоритеты (бар) + статусы (пирог).
+    Возвращает BytesIO с картинкой или None если данных нет.
+    """
+    if not jira:
+        return None
+    by_priority = jira.get("by_priority", {})
+    by_status   = jira.get("by_status", {})
+    if not by_priority and not by_status:
+        return None
+
+    try:
+        plt.style.use("dark_background")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle("TeamTrustGate — аналитика за 30 дней", fontsize=16, fontweight="bold")
+
+        # График 1: приоритеты (горизонтальный бар)
+        ax1 = axes[0]
+        priority_order = ["Highest", "High", "Medium", "Low"]
+        colors_map = {"Highest": "#e74c3c", "High": "#e67e22", "Medium": "#f1c40f", "Low": "#2ecc71"}
+        labels, values, colors = [], [], []
+        for p in priority_order:
+            if by_priority.get(p, 0) > 0:
+                labels.append(p)
+                values.append(by_priority[p])
+                colors.append(colors_map[p])
+        if values:
+            bars = ax1.barh(labels, values, color=colors)
+            ax1.set_title("По приоритетам", fontsize=13)
+            ax1.set_xlabel("Тикетов")
+            ax1.invert_yaxis()
+            for bar, val in zip(bars, values):
+                ax1.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height() / 2,
+                         str(val), va="center", fontweight="bold")
+        else:
+            ax1.text(0.5, 0.5, "Нет данных", ha="center", va="center")
+            ax1.set_title("По приоритетам")
+
+        # График 2: статусы (пирог)
+        ax2 = axes[1]
+        if by_status:
+            status_labels = list(by_status.keys())
+            status_values = list(by_status.values())
+            ax2.pie(status_values, labels=status_labels, autopct="%1.0f%%",
+                    startangle=90, textprops={"fontsize": 10})
+            ax2.set_title("По статусам", fontsize=13)
+        else:
+            ax2.text(0.5, 0.5, "Нет данных", ha="center", va="center")
+            ax2.set_title("По статусам")
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.warning(f"stats: не удалось сгенерировать график: {e}")
+        return None
 
 # ── Transition helpers ────────────────────────────────────────────────────
 _TRANSITION_NAMES = {
@@ -777,15 +843,29 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"stats: не удалось получить данные из Jira: {e}")
         jira = None
 
-    await update.message.reply_text(
-        _build_stats_message(local, jira),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "🔗 Открыть проект в Jira",
-                url=f"{CONFIG.JIRA_URL}/projects/{CONFIG.JIRA_PROJECT_KEY}"
+    stats_text = _build_stats_message(local, jira)
+    jira_button = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔗 Открыть проект в Jira",
+            url=f"{CONFIG.JIRA_URL}/projects/{CONFIG.JIRA_PROJECT_KEY}"
+        )
+    ]])
+
+    # Пробуем сгенерировать график и отправить картинкой с текстом в подписи
+    chart = _generate_stats_chart(jira)
+    if chart:
+        # Подпись к фото ограничена 1024 символами — если текст длиннее, шлём отдельно
+        if len(stats_text) <= 1024:
+            await update.message.reply_photo(
+                photo=chart, caption=stats_text,
+                parse_mode="Markdown", reply_markup=jira_button,
             )
-        ]])
-    )
+        else:
+            await update.message.reply_photo(photo=chart)
+            await update.message.reply_text(stats_text, reply_markup=jira_button)
+    else:
+        # График не получился (нет данных или ошибка) — только текст
+        await update.message.reply_text(stats_text, reply_markup=jira_button)
 
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выгружает тикеты teamtrustgate в CSV файл. Только для админов."""
