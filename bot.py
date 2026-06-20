@@ -39,6 +39,13 @@ scorer = Scorer(llm)
 
 STATUS_POLL_INTERVAL = 300  # 5 минут
 
+# ── SLA настройки ─────────────────────────────────────────────────────────
+SLA_CHECK_INTERVAL = 86400      # раз в сутки (в секундах)
+SLA_STALE_DAYS = 3              # Highest/High висит в To Do дольше N дней → алерт
+SLA_DEADLINE_WARN_DAYS = 2      # дедлайн через ≤N дней, а тикет не в работе → алерт
+# Статусы которые считаются "ещё не начали работать"
+_TODO_STATUSES = {"to do", "to-do", "todo", "open", "backlog", "новый", "к выполнению", "обработка"}
+
 # ── Load prompts ──────────────────────────────────────────────────────────
 def _load_prompt(name: str) -> str:
     for ext in ("md", "txt"):
@@ -333,6 +340,122 @@ async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
                 STATE_MANAGER.update_ticket_status(issue_key, current_status)
         else:
             STATE_MANAGER.update_ticket_status(issue_key, current_status)
+
+def _admin_chat_ids() -> list:
+    """
+    Возвращает chat_id всех админов, которые писали боту.
+    Берём из tracked_tickets: ищем владельцев-админов.
+    """
+    seen = set()
+    result = []
+    for t in STATE_MANAGER.get_tracked_tickets():
+        uname = t.get("username") or ""
+        cid = t.get("chat_id")
+        if cid and cid not in seen and _is_admin(uname):
+            seen.add(cid)
+            result.append(cid)
+    return result
+
+async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ежедневная SLA-проверка. Шлёт алерты админам если:
+    - Highest/High тикет висит в To Do дольше SLA_STALE_DAYS дней
+    - Дедлайн (duedate) приближается (≤SLA_DEADLINE_WARN_DAYS), а тикет не в работе
+    Каждый алерт отправляется один раз (защита через sent_alerts).
+    """
+    admin_ids = _admin_chat_ids()
+    if not admin_ids:
+        logger.info("sla: нет известных админов для алертов, пропускаю")
+        return
+
+    try:
+        candidates = await JIRA_CLIENT.search_sla_candidates(max_results=100)
+    except Exception as e:
+        logger.warning(f"sla: не удалось получить тикеты: {e}")
+        return
+
+    today = date.today()
+    alerts_sent = 0
+
+    for t in candidates:
+        issue_key = t["key"]
+        priority  = t.get("priority", "Low")
+        status    = (t.get("status") or "").lower()
+        summary   = t.get("summary", "")[:80]
+        created   = t.get("created", "")
+        duedate   = t.get("duedate")
+
+        is_todo = status in _TODO_STATUSES
+
+        # ── Алерт 1: застрявший важный тикет ──
+        if priority in ("Highest", "High") and is_todo and created:
+            try:
+                created_date = datetime.strptime(created[:10], "%Y-%m-%d").date()
+                days_stale = (today - created_date).days
+            except (ValueError, TypeError):
+                days_stale = 0
+
+            if days_stale >= SLA_STALE_DAYS:
+                if not STATE_MANAGER.was_alert_sent(issue_key, "stale"):
+                    emoji = _priority_emoji(priority)
+                    msg = (
+                        f"🚨 *SLA: тикет завис без движения*\n\n"
+                        f"{emoji} [{issue_key}]({CONFIG.JIRA_URL}/browse/{issue_key}) — *{priority}*\n"
+                        f"📋 {_escape_md(summary)}\n\n"
+                        f"⏳ Висит в *«{_escape_md(t.get('status',''))}»* уже *{days_stale} дн.* "
+                        f"без начала работы.\n"
+                        f"Пора взять в работу или пересмотреть приоритет."
+                    )
+                    for cid in admin_ids:
+                        try:
+                            await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning(f"sla: не доставлено {cid}: {e}")
+                    STATE_MANAGER.mark_alert_sent(issue_key, "stale")
+                    alerts_sent += 1
+                    logger.info(f"sla: stale-алерт {issue_key} ({days_stale}д)")
+            else:
+                # тикет ещё свежий — сбрасываем возможную старую отметку
+                STATE_MANAGER.clear_alert(issue_key, "stale")
+        else:
+            # тикет уже в работе или не важный — снимаем stale-алерт
+            STATE_MANAGER.clear_alert(issue_key, "stale")
+
+        # ── Алерт 2: приближается дедлайн, а работа не началась ──
+        if duedate and is_todo:
+            try:
+                due = datetime.strptime(str(duedate)[:10], "%Y-%m-%d").date()
+                days_left = (due - today).days
+            except (ValueError, TypeError):
+                days_left = 999
+
+            if days_left <= SLA_DEADLINE_WARN_DAYS:
+                if not STATE_MANAGER.was_alert_sent(issue_key, "deadline"):
+                    when = "просрочен" if days_left < 0 else (
+                        "сегодня" if days_left == 0 else f"через {days_left} дн."
+                    )
+                    emoji = _priority_emoji(priority)
+                    msg = (
+                        f"⏰ *SLA: приближается дедлайн*\n\n"
+                        f"{emoji} [{issue_key}]({CONFIG.JIRA_URL}/browse/{issue_key}) — *{priority}*\n"
+                        f"📋 {_escape_md(summary)}\n\n"
+                        f"📆 Срок: *{due.strftime('%d.%m.%Y')}* ({when}), "
+                        f"а тикет ещё *«{_escape_md(t.get('status',''))}»*.\n"
+                        f"Нужно начать работу, чтобы успеть."
+                    )
+                    for cid in admin_ids:
+                        try:
+                            await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning(f"sla: не доставлено {cid}: {e}")
+                    STATE_MANAGER.mark_alert_sent(issue_key, "deadline")
+                    alerts_sent += 1
+                    logger.info(f"sla: deadline-алерт {issue_key} ({days_left}д)")
+        else:
+            # дедлайна нет или тикет в работе — снимаем deadline-алерт
+            STATE_MANAGER.clear_alert(issue_key, "deadline")
+
+    logger.info(f"sla: проверка завершена, отправлено {alerts_sent} алертов")
 
 # ── Callback query handler ─────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1062,6 +1185,8 @@ def main():
     if job_queue:
         job_queue.run_repeating(_poll_status_changes, interval=STATUS_POLL_INTERVAL, first=60)
         logger.info(f"Status polling запущен (каждые {STATUS_POLL_INTERVAL}с)")
+        job_queue.run_repeating(_check_sla, interval=SLA_CHECK_INTERVAL, first=120)
+        logger.info(f"SLA-проверка запущена (каждые {SLA_CHECK_INTERVAL}с)")
     else:
         logger.warning("JobQueue недоступна. Установи: pip install 'python-telegram-bot[job-queue]'")
 
