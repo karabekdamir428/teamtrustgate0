@@ -46,6 +46,15 @@ class StateManager:
                     updated_at TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sent_alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_key TEXT NOT NULL,
+                    alert_type TEXT NOT NULL,
+                    sent_at TEXT,
+                    UNIQUE(issue_key, alert_type)
+                )
+            """)
             conn.commit()
 
     # ── Sessions ──────────────────────────────────────────────────────────
@@ -159,6 +168,37 @@ class StateManager:
     def untrack_ticket(self, issue_key: str):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM tracked_tickets WHERE issue_key = ?", (issue_key,))
+            conn.execute("DELETE FROM sent_alerts WHERE issue_key = ?", (issue_key,))
+            conn.commit()
+
+    # ── SLA alerts ─────────────────────────────────────────────────────────
+    def was_alert_sent(self, issue_key: str, alert_type: str) -> bool:
+        """Проверяет был ли уже отправлен алерт данного типа для тикета."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sent_alerts WHERE issue_key = ? AND alert_type = ?",
+                (issue_key, alert_type)
+            ).fetchone()
+            return row is not None
+
+    def mark_alert_sent(self, issue_key: str, alert_type: str):
+        """Помечает что алерт отправлен, чтобы не повторять."""
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO sent_alerts (issue_key, alert_type, sent_at)
+                VALUES (?, ?, ?)""",
+                (issue_key, alert_type, now)
+            )
+            conn.commit()
+
+    def clear_alert(self, issue_key: str, alert_type: str):
+        """Сбрасывает отметку об алерте (если тикет сдвинулся — можно алертить заново)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM sent_alerts WHERE issue_key = ? AND alert_type = ?",
+                (issue_key, alert_type)
+            )
             conn.commit()
 
     # ── Stats ──────────────────────────────────────────────────────────────
