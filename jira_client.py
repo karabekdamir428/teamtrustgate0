@@ -249,6 +249,33 @@ class JiraClient:
         logger.info(f"jira: экспортировано {len(result)} тикетов за {days} дней")
         return result
 
+    async def search_sla_candidates(self, max_results: int = 100) -> List[Dict[str, Any]]:
+        """
+        Открытые (не закрытые) тикеты проекта для SLA-проверки.
+        Возвращает приоритет, статус, дату создания и дедлайн (duedate).
+        """
+        jql = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f"AND statusCategory != Done "
+            f"ORDER BY created ASC"
+        )
+        issues = await self._search(
+            jql, ["summary", "status", "priority", "created", "duedate"], max_results
+        )
+        result = []
+        for i in issues:
+            f = i["fields"]
+            result.append({
+                "key":      i["key"],
+                "summary":  f.get("summary", ""),
+                "status":   (f.get("status") or {}).get("name", ""),
+                "priority": (f.get("priority") or {}).get("name", "Low"),
+                "created":  (f.get("created") or "")[:10],
+                "duedate":  f.get("duedate"),  # YYYY-MM-DD или None
+            })
+        logger.info(f"jira: SLA-проверка — {len(result)} открытых тикетов")
+        return result
+
     async def create_issue(
         self,
         summary: str,
